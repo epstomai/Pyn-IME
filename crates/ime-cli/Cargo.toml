@@ -1,0 +1,9 @@
+[package]
+name = "ime-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ime-core = { path = "../ime-core" }
+serde.workspace = true
+serde_json.workspace = true

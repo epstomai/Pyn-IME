@@ -1,0 +1,88 @@
+[
+  {
+    "id": "pol-le-once",
+    "desc": "打 le 时误选一次「乐」",
+    "preamble": [{"keys": "le", "pick": "乐", "times": 1}]
+  },
+  {
+    "id": "pol-le-thrice",
+    "desc": "打 le 时误选三次「乐」",
+    "preamble": [{"keys": "le", "pick": "乐", "times": 3}]
+  },
+  {
+    "id": "pol-de-dei",
+    "desc": "打 de 时三次选「得」",
+    "preamble": [{"keys": "de", "pick": "得", "times": 3}]
+  },
+  {
+    "id": "pol-de-di",
+    "desc": "打 de 时三次选「地」",
+    "preamble": [{"keys": "de", "pick": "地", "times": 3}]
+  },
+  {
+    "id": "pol-d-da-once",
+    "desc": "打 d 时误选一次「打」",
+    "preamble": [{"keys": "d", "pick": "打", "times": 1}]
+  },
+  {
+    "id": "pol-d-da-thrice",
+    "desc": "打 d 时误选三次「打」",
+    "preamble": [{"keys": "d", "pick": "打", "times": 3}]
+  },
+  {
+    "id": "pol-ma",
+    "desc": "打 ma 时三次选「马」",
+    "preamble": [{"keys": "ma", "pick": "马", "times": 3}]
+  },
+  {
+    "id": "pol-ba",
+    "desc": "打 ba 时三次选「把」",
+    "preamble": [{"keys": "ba", "pick": "把", "times": 3}]
+  },
+  {
+    "id": "pol-guo",
+    "desc": "打 guo 时三次选「国」",
+    "preamble": [{"keys": "guo", "pick": "国", "times": 3}]
+  },
+  {
+    "id": "pol-zhe",
+    "desc": "打 zhe 时三次选「这」",
+    "preamble": [{"keys": "zhe", "pick": "这", "times": 3}]
+  },
+  {
+    "id": "pol-legit-words",
+    "desc": "正常使用含同音字的词各五次",
+    "preamble": [
+      {"keys": "kuaile", "pick": "快乐", "times": 5},
+      {"keys": "juede", "pick": "觉得", "times": 5},
+      {"keys": "zhongguo", "pick": "中国", "times": 5},
+      {"keys": "mama", "pick": "妈妈", "times": 5},
+      {"keys": "baba", "pick": "爸爸", "times": 5},
+      {"keys": "jizhe", "pick": "记者", "times": 5}
+    ]
+  },
+  {
+    "id": "pol-sentence-mispick",
+    "desc": "整句里把句尾虚词选错两次",
+    "preamble": [
+      {"keys": "woshuole", "pick": "我说乐", "times": 2},
+      {"keys": "haode", "pick": "好得", "times": 2},
+      {"keys": "zouba", "pick": "走把", "times": 2}
+    ]
+  },
+  {
+    "id": "pol-mixed",
+    "desc": "以上各种误选混合出现",
+    "preamble": [
+      {"keys": "le", "pick": "乐", "times": 2},
+      {"keys": "de", "pick": "得", "times": 2},
+      {"keys": "d", "pick": "打", "times": 2},
+      {"keys": "ma", "pick": "马", "times": 2},
+      {"keys": "ba", "pick": "把", "times": 2},
+      {"keys": "guo", "pick": "国", "times": 2},
+      {"keys": "zhe", "pick": "这", "times": 2},
+      {"keys": "kuaile", "pick": "快乐", "times": 3},
+      {"keys": "woshuole", "pick": "我说乐", "times": 1}
+    ]
+  }
+]

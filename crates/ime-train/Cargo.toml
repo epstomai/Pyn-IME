@@ -1,0 +1,7 @@
+[package]
+name = "ime-train"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ime-core = { path = "../ime-core" }

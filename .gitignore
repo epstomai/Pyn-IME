@@ -1,0 +1,17 @@
+# Downloaded third-party engines, models and corpora (see README for sources)
+/.external/
+
+# Build outputs and local environments
+/target/
+/.venv/
+__pycache__/
+*.pyc
+
+# Evaluation run outputs; the baseline summary lives in docs/
+/eval/reports/
+
+# Trained binary language models
+/models/
+
+# Local agent workspace metadata
+/.antigravity/

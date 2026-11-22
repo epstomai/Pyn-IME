@@ -1,0 +1,76 @@
+# 简拼尾字与单键简拼用例源文件。
+#
+# 格式沿用 function_words.txt，并通过 || keys=<简拼按键> 指定实际输入按键串。
+# 针对「打 d 误选打」「打 l 误选乐」等单键或尾字简拼场景，确保虚词不被抢位。
+
+@ suite=abbrev gate=1 tags=的,单键简拼
+[的] || keys=d
+好 >> [的] || keys=d
+是 >> [的] || keys=d
+这是我 >> [的] || keys=d
+这本书是我 >> [的] || keys=d
+这是我昨天买 >> [的] || keys=d
+他肯定会来 >> [的] || keys=d
+没问题 >> [的] || keys=d
+我会一直支持你 >> [的] || keys=d
+这些都是真 >> [的] || keys=d
+我是认真 >> [的] || keys=d
+
+@ suite=abbrev gate=1 tags=了,单键简拼
+[了] || keys=l
+我知道 >> [了] || keys=l
+我已经吃过饭 >> [了] || keys=l
+外面下雨 >> [了] || keys=l
+手机没电 >> [了] || keys=l
+时间不早 >> [了] || keys=l
+我们该走 >> [了] || keys=l
+太好 >> [了] || keys=l
+作业写完 >> [了] || keys=l
+电脑又死机 >> [了] || keys=l
+我吃饱 >> [了] || keys=l
+
+@ suite=abbrev gate=1 tags=吧,单键简拼
+我们走 >> [吧] || keys=b
+快点 >> [吧] || keys=b
+明天再说 >> [吧] || keys=b
+就这样 >> [吧] || keys=b
+早点睡 >> [吧] || keys=b
+算了 >> [吧] || keys=b
+
+@ suite=abbrev gate=1 tags=吗,单键简拼
+你好 >> [吗] || keys=m
+你吃饭了 >> [吗] || keys=m
+你是学生 >> [吗] || keys=m
+这是你的手机 >> [吗] || keys=m
+这样可以 >> [吗] || keys=m
+你知道这件事 >> [吗] || keys=m
+
+@ suite=abbrev gate=1 tags=尾字简拼
+好[的] || keys=haod
+这是我[的] || keys=zheshiwod
+我说[的] || keys=woshuod
+没问题[的] || keys=meiwentid
+这本书是我[的] || keys=zhebenshushiwod
+知道[了] || keys=zhidaol
+我知道[了] || keys=wozhidaol
+我吃过[了] || keys=wochiguol
+下雨[了] || keys=xiayul
+好[了] || keys=haol
+太高兴[了] || keys=taigaoxingl
+作业写完[了] || keys=zuoyexiewanl
+走[吧] || keys=zoub
+我们走[吧] || keys=womenzoub
+算了[吧] || keys=suanleb
+明天再说[吧] || keys=mingtianzaishuob
+你吃饭了[吗] || keys=nichifanlem
+你是学生[吗] || keys=nishixueshengm
+
+# 高歧义简拼：存在多个合理常用词竞争，只计分，不作门禁。
+@ suite=abbrev gate=0 tags=尾字简拼,高歧义
+是[的] || keys=shid
+你好[吗] || keys=nihaom
+有空[吗] || keys=youkongm
+可以[吗] || keys=keyim
+在家[吗] || keys=zaijiam
+明天有空 >> [吗] || keys=m
+你确定 >> [吗] || keys=m

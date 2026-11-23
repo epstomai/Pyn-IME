@@ -662,4 +662,210 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(engine2.convert("kuaixing", 5).first().map(String::as_str), Some("快杏"));
     }
+
+    fn make_mixed_abbrev_toy_model() -> Model {
+        let words = [
+            "<bos>", "<eos>", "<pause>", "硬", "盘", "硬盘", "计", "算", "机", "计算机", "时",
+            "间", "时间", "开", "始", "开始", "中", "华", "中华", "固", "态", "固态硬盘",
+        ];
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        let mut word_bytes = Vec::new();
+        for w in &words {
+            word_offsets.push(word_bytes.len() as u32);
+            word_bytes.extend_from_slice(w.as_bytes());
+        }
+        word_offsets.push(word_bytes.len() as u32);
+
+        let n = words.len();
+        let mut unigram_logp = vec![-8.0_f32; n];
+        unigram_logp[EOS_ID as usize] = -2.0;
+        unigram_logp[PAUSE_ID as usize] = -2.5;
+        unigram_logp[3] = -5.5; // 硬
+        unigram_logp[4] = -5.0; // 盘
+        unigram_logp[5] = -2.0; // 硬盘
+        unigram_logp[6] = -5.5; // 计
+        unigram_logp[7] = -5.5; // 算
+        unigram_logp[8] = -5.5; // 机
+        unigram_logp[9] = -1.8; // 计算机
+        unigram_logp[10] = -5.5; // 时
+        unigram_logp[11] = -5.5; // 间
+        unigram_logp[12] = -1.7; // 时间
+        unigram_logp[13] = -5.5; // 开
+        unigram_logp[14] = -5.5; // 始
+        unigram_logp[15] = -1.7; // 开始
+        unigram_logp[16] = -5.5; // 中
+        unigram_logp[17] = -5.5; // 华
+        unigram_logp[18] = -2.2; // 中华
+        unigram_logp[19] = -5.5; // 固
+        unigram_logp[20] = -5.5; // 态
+        unigram_logp[21] = -2.5; // 固态硬盘
+        let unigram_bow = vec![-0.2_f32; n];
+
+        let ying = syllable_id("ying").unwrap();
+        let pan = syllable_id("pan").unwrap();
+        let ji = syllable_id("ji").unwrap();
+        let suan = syllable_id("suan").unwrap();
+        let shi = syllable_id("shi").unwrap();
+        let jian = syllable_id("jian").unwrap();
+        let kai = syllable_id("kai").unwrap();
+        let zhong = syllable_id("zhong").unwrap();
+        let hua = syllable_id("hua").unwrap();
+        let gu = syllable_id("gu").unwrap();
+        let tai = syllable_id("tai").unwrap();
+
+        let exact = build_lex_table(
+            vec![
+                (pack_exact(&[ying]).unwrap(), LexEntry { word_id: 3, reading_logp: 0.0 }),
+                (pack_exact(&[pan]).unwrap(), LexEntry { word_id: 4, reading_logp: 0.0 }),
+                (pack_exact(&[ying, pan]).unwrap(), LexEntry { word_id: 5, reading_logp: 0.0 }),
+                (pack_exact(&[ji]).unwrap(), LexEntry { word_id: 6, reading_logp: -0.2 }),
+                (pack_exact(&[suan]).unwrap(), LexEntry { word_id: 7, reading_logp: 0.0 }),
+                (pack_exact(&[ji]).unwrap(), LexEntry { word_id: 8, reading_logp: -0.5 }),
+                (pack_exact(&[ji, suan, ji]).unwrap(), LexEntry { word_id: 9, reading_logp: 0.0 }),
+                (pack_exact(&[shi]).unwrap(), LexEntry { word_id: 10, reading_logp: 0.0 }),
+                (pack_exact(&[jian]).unwrap(), LexEntry { word_id: 11, reading_logp: 0.0 }),
+                (pack_exact(&[shi, jian]).unwrap(), LexEntry { word_id: 12, reading_logp: 0.0 }),
+                (pack_exact(&[kai]).unwrap(), LexEntry { word_id: 13, reading_logp: 0.0 }),
+                (pack_exact(&[shi]).unwrap(), LexEntry { word_id: 14, reading_logp: -0.3 }),
+                (pack_exact(&[kai, shi]).unwrap(), LexEntry { word_id: 15, reading_logp: 0.0 }),
+                (pack_exact(&[zhong]).unwrap(), LexEntry { word_id: 16, reading_logp: 0.0 }),
+                (pack_exact(&[hua]).unwrap(), LexEntry { word_id: 17, reading_logp: 0.0 }),
+                (pack_exact(&[zhong, hua]).unwrap(), LexEntry { word_id: 18, reading_logp: 0.0 }),
+                (pack_exact(&[gu]).unwrap(), LexEntry { word_id: 19, reading_logp: 0.0 }),
+                (pack_exact(&[tai]).unwrap(), LexEntry { word_id: 20, reading_logp: 0.0 }),
+                (
+                    pack_exact(&[gu, tai, ying, pan]).unwrap(),
+                    LexEntry { word_id: 21, reading_logp: 0.0 },
+                ),
+            ]
+            .into_iter(),
+        );
+
+        let mut initial_chars: [Vec<LexEntry>; 26] = std::array::from_fn(|_| Vec::new());
+        initial_chars[(b'y' - b'a') as usize] = vec![LexEntry { word_id: 3, reading_logp: 0.0 }];
+        initial_chars[(b'j' - b'a') as usize] = vec![LexEntry { word_id: 6, reading_logp: 0.0 }];
+        initial_chars[(b's' - b'a') as usize] = vec![LexEntry { word_id: 10, reading_logp: 0.0 }];
+        initial_chars[(b'z' - b'a') as usize] = vec![LexEntry { word_id: 16, reading_logp: 0.0 }];
+        initial_chars[(b'h' - b'a') as usize] = vec![LexEntry { word_id: 17, reading_logp: 0.0 }];
+
+        let abbrev_tail = build_lex_table(
+            [(
+                pack_abbrev_tail(&[ying], b'p' - b'a').unwrap(),
+                LexEntry { word_id: 5, reading_logp: 0.0 },
+            )]
+            .into_iter(),
+        );
+        let abbrev_init = build_lex_table(
+            [
+                (
+                    pack_initials(&[b'y' - b'a', b'p' - b'a']).unwrap(),
+                    LexEntry { word_id: 5, reading_logp: 0.0 },
+                ),
+                (
+                    pack_initials(&[b'z' - b'a', b'h' - b'a']).unwrap(),
+                    LexEntry { word_id: 18, reading_logp: 0.0 },
+                ),
+            ]
+            .into_iter(),
+        );
+
+        let mut bigram_offsets = vec![0u32; n + 1];
+        let mut bigram_w2 = Vec::new();
+        let mut bigram_logp = Vec::new();
+        let mut bigram_bow = Vec::new();
+        for w1 in 0..n {
+            bigram_offsets[w1] = bigram_w2.len() as u32;
+            match w1 {
+                0 => {
+                    bigram_w2.extend_from_slice(&[5, 9, 12, 15, 18, 21]);
+                    bigram_logp.extend_from_slice(&[-1.5, -1.2, -1.1, -1.1, -1.5, -1.5]);
+                    bigram_bow.extend_from_slice(&[-0.1; 6]);
+                }
+                5 | 9 | 12 | 15 | 18 | 21 => {
+                    bigram_w2.push(EOS_ID);
+                    bigram_logp.push(-0.2);
+                    bigram_bow.push(-0.1);
+                }
+                _ => {}
+            }
+        }
+        bigram_offsets[n] = bigram_w2.len() as u32;
+        let trigram_offsets = vec![0u32; bigram_w2.len() + 1];
+
+        Model::from_parts(
+            word_offsets,
+            word_bytes,
+            unigram_logp,
+            unigram_bow,
+            exact,
+            initial_chars,
+            abbrev_tail,
+            abbrev_init,
+            bigram_offsets,
+            bigram_w2,
+            bigram_logp,
+            bigram_bow,
+            trigram_offsets,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn mixed_front_abbrev_digraphs_and_cross_caret_join() {
+        use crate::pinyin::DigraphInitial;
+
+        let shjian = build_dag("shjian");
+        assert!(!shjian.exact_only);
+        assert!(shjian.edges_from[0]
+            .iter()
+            .any(|e| e.end == 2 && e.kind == DagEdgeKind::Abbrev2(DigraphInitial::Sh)));
+
+        let z_h = build_dag("z'h");
+        assert!(!z_h.exact_only);
+        assert!(z_h.edges_from[0]
+            .iter()
+            .all(|e| !matches!(e.kind, DagEdgeKind::Abbrev2(_))));
+
+        // Full pinyin remains strictly exact-only without Abbrev/Abbrev2 edges.
+        for exact_input in ["xian", "yuan", "zhou", "shuo"] {
+            let dag = build_dag(exact_input);
+            assert!(dag.exact_only, "{exact_input} should remain exact_only");
+            assert!(dag
+                .edges_from
+                .iter()
+                .flatten()
+                .all(|e| matches!(e.kind, DagEdgeKind::Exact(_))));
+        }
+
+        let model = Arc::new(make_mixed_abbrev_toy_model());
+        let mut engine = Engine::with_model(model);
+
+        // Front-abbr + back-full matches symmetrically with back-abbr.
+        assert_eq!(engine.convert("ypan", 5).first().map(String::as_str), Some("硬盘"));
+        assert_eq!(engine.convert("yingp", 5).first().map(String::as_str), Some("硬盘"));
+
+        // 3-char mixed: [A, E, E], [E, A, E], [A, A, E]
+        assert_eq!(engine.convert("jsuanji", 5).first().map(String::as_str), Some("计算机"));
+        assert_eq!(engine.convert("jisji", 5).first().map(String::as_str), Some("计算机"));
+        assert_eq!(engine.convert("jsji", 5).first().map(String::as_str), Some("计算机"));
+
+        // Digraph initials zh/ch/sh in [A2, E] and [E, A2] without breaking standalone `zh`.
+        assert_eq!(engine.convert("shjian", 5).first().map(String::as_str), Some("时间"));
+        assert_eq!(engine.convert("kaish", 5).first().map(String::as_str), Some("开始"));
+        assert_eq!(engine.convert("zh", 5).first().map(String::as_str), Some("中华"));
+
+        // Cross-caret join with SpanPron::Mixed: [固态] + ypan -> 硬盘
+        let mut alt_model = make_mixed_abbrev_toy_model();
+        // Give standalone 硬盘 worse <bos> score so joined 固态硬盘 wins when context is 固态.
+        let pan_id = alt_model.word_id("硬盘").unwrap();
+        let pan_bg = alt_model.bigram_index(BOS_ID, pan_id).unwrap();
+        alt_model.bigram_logp[pan_bg] = -9.0;
+        let mut engine2 = Engine::with_model(Arc::new(alt_model));
+        engine2.set_context(vec![ContextSegment {
+            text: "固态".into(),
+            keys: None,
+        }]);
+        assert_eq!(engine2.convert("ypan", 5).first().map(String::as_str), Some("硬盘"));
+    }
 }

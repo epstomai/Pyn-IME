@@ -20,7 +20,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Threading::CreateMutexW;
 use windows_core::PCWSTR;
 
-const MUTEX_NAME: &str = r"Local\InputEngineServerMutex_v1";
+const MUTEX_NAME: &str = r"Local\PynServerMutex_v1";
 const SAVE_DEBOUNCE_SECS: u64 = 10;
 const MAX_SESSIONS: usize = 64;
 
@@ -119,7 +119,7 @@ fn resolve_user_dict_path(explicit: Option<PathBuf>) -> PathBuf {
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         if !local_app_data.is_empty() {
             return PathBuf::from(local_app_data)
-                .join("InputEngine")
+                .join("Pyn")
                 .join("user_dict.tsv");
         }
     }

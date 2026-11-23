@@ -114,9 +114,57 @@ pub fn pack_initials(letters: &[u8]) -> Option<u64> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigraphInitial {
+    Zh,
+    Ch,
+    Sh,
+}
+
+impl DigraphInitial {
+    #[inline]
+    pub fn first_letter(self) -> u8 {
+        self.first_byte() - b'a'
+    }
+
+    #[inline]
+    pub fn first_byte(self) -> u8 {
+        match self {
+            Self::Zh => b'z',
+            Self::Ch => b'c',
+            Self::Sh => b's',
+        }
+    }
+}
+
+#[inline]
+pub fn syllable_matches_digraph(id: SyllableId, di: DigraphInitial) -> bool {
+    let bytes = syllable_str(id).as_bytes();
+    bytes.len() >= 2 && bytes[0] == di.first_byte() && bytes[1] == b'h'
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DagEdgeKind {
     Exact(SyllableId),
     Abbrev(u8),
+    Abbrev2(DigraphInitial),
+}
+
+#[inline]
+pub fn unit_first_letter(unit: DagEdgeKind) -> u8 {
+    match unit {
+        DagEdgeKind::Exact(id) => syllable_first_letter(id),
+        DagEdgeKind::Abbrev(lt) => lt,
+        DagEdgeKind::Abbrev2(di) => di.first_letter(),
+    }
+}
+
+#[inline]
+pub fn syllable_matches_unit(id: SyllableId, unit: DagEdgeKind) -> bool {
+    match unit {
+        DagEdgeKind::Exact(target) => id == target,
+        DagEdgeKind::Abbrev(lt) => syllable_first_letter(id) == lt,
+        DagEdgeKind::Abbrev2(di) => syllable_matches_digraph(id, di),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +181,10 @@ pub enum SpanPron {
     AbbrevInit {
         len: u8,
         letters: [u8; 6],
+    },
+    Mixed {
+        len: u8,
+        units: [DagEdgeKind; 6],
     },
 }
 
@@ -223,6 +275,21 @@ pub fn build_dag(keys: &str) -> PinyinDag {
                     end: i + 1,
                     kind: DagEdgeKind::Abbrev(letter),
                 });
+            }
+            if i + 2 <= n && !boundary_before[i + 1] {
+                let digraph = match &norm[i..i + 2] {
+                    b"zh" => Some(DigraphInitial::Zh),
+                    b"ch" => Some(DigraphInitial::Ch),
+                    b"sh" => Some(DigraphInitial::Sh),
+                    _ => None,
+                };
+                if let Some(di) = digraph {
+                    edges_from[i].push(DagEdge {
+                        start: i,
+                        end: i + 2,
+                        kind: DagEdgeKind::Abbrev2(di),
+                    });
+                }
             }
         }
     }

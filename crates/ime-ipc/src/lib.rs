@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn named_pipe_appcontainer_dacl_roundtrip() {
-        let pipe_name = format!(r"\\.\pipe\InputEngineTSF_unit_test_{}", std::process::id());
+        let pipe_name = format!(r"\\.\pipe\PynTSF_unit_test_{}", std::process::id());
         let server = NamedPipeServerInstance::create(&pipe_name).unwrap();
         let pipe_name_srv = pipe_name.clone();
         let handle = thread::spawn(move || {

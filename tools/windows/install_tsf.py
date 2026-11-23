@@ -1,4 +1,4 @@
-"""Deploy, ACL, register, hot-swap, and manage Input Engine Windows TSF service."""
+"""Deploy, ACL, register, hot-swap, and manage Pyn Windows TSF service."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,8 @@ import winreg
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "InputEngine"
+DEFAULT_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Pyn"
+LEGACY_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "InputEngine"
 LEGACY_CLSID = "{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0101}"
 LEGACY_PROFILE = "{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0102}"
 CLSID_STR = LEGACY_CLSID
@@ -360,11 +361,33 @@ def _shutdown_server_and_wait(srv: Path, timeout_sec: float = 3.0) -> None:
             return
 
 
+def _migrate_legacy_user_data() -> None:
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if not local_app_data:
+        return
+    legacy_dir = Path(local_app_data) / "InputEngine"
+    new_dir = Path(local_app_data) / "Pyn"
+    if not legacy_dir.is_dir():
+        return
+    migrated: list[str] = []
+    for name in ("config.json", "user_dict.tsv"):
+        src = legacy_dir / name
+        dst = new_dir / name
+        if src.is_file() and not dst.exists():
+            new_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            migrated.append(name)
+    if migrated:
+        print(f"migrated user data from {legacy_dir} -> {new_dir}: {', '.join(migrated)}")
+
+
 def cmd_deploy(args) -> None:
     if not is_admin() and str(args.dir).lower().startswith(
         os.environ.get("ProgramFiles", r"C:\Program Files").lower()
     ):
         raise SystemExit("deploy to Program Files requires Administrator privileges")
+
+    _migrate_legacy_user_data()
 
     release = ROOT / "target" / "release"
     dll_src = release / "ime_tsf.dll"
@@ -388,6 +411,8 @@ def cmd_deploy(args) -> None:
 
     dst_srv = target_dir / "ime-server.exe"
     _shutdown_server_and_wait(dst_srv)
+    if target_dir.resolve() != LEGACY_DIR.resolve():
+        _shutdown_server_and_wait(LEGACY_DIR / "ime-server.exe")
 
     old_gens = discover_registered_generations()
     new_gen = choose_next_generation(target_dir, old_gens)
@@ -533,7 +558,7 @@ def cmd_unregister(args) -> None:
         _unregister_generation(g)
     _cleanup_obsolete_dlls(base_dir, set())
     gen_str = ", ".join(f"g{g:04x}" for g in gens)
-    print(f"unregistered all Input Engine TSF generations: {gen_str}")
+    print(f"unregistered all Pyn TSF generations: {gen_str}")
 
 
 def cmd_start(args) -> None:
@@ -559,13 +584,15 @@ def _create_settings_shortcut(target_exe: Path) -> None:
     programs_dir = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
     if not programs_dir.exists():
         return
-    lnk = programs_dir / "Input Engine 设置.lnk"
+    old_lnk = programs_dir / "Input Engine 设置.lnk"
+    _try_remove_file(old_lnk)
+    lnk = programs_dir / "Pyn 设置.lnk"
     ps = (
         f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{str(lnk)}');"
         f"$s.TargetPath='{str(target_exe)}';"
         f"$s.WorkingDirectory='{str(target_exe.parent)}';"
         f"$s.IconLocation='{str(target_exe)},0';"
-        "$s.Description='Input Engine 外观与输入设置';"
+        "$s.Description='Pyn 外观与输入设置';"
         "$s.Save()"
     )
     subprocess.run(

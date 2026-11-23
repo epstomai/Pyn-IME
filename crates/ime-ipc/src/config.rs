@@ -93,7 +93,7 @@ impl ImeConfig {
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             if !local_app_data.is_empty() {
                 return PathBuf::from(local_app_data)
-                    .join("InputEngine")
+                    .join("Pyn")
                     .join("config.json");
             }
         }

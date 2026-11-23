@@ -20,7 +20,7 @@ impl ITfDisplayAttributeInfo_Impl for InputDisplayAttributeInfo_Impl {
     }
 
     fn GetDescription(&self) -> Result<BSTR> {
-        Ok(BSTR::from("Input Engine Preedit"))
+        Ok(BSTR::from("Pyn Preedit"))
     }
 
     fn GetAttributeInfo(&self, pda: *mut TF_DISPLAYATTRIBUTE) -> Result<()> {

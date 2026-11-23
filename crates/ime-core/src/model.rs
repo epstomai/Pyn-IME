@@ -4,7 +4,10 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::pinyin::{pack_exact, syllable_first_letter, SpanPron, SyllableId};
+use crate::pinyin::{
+    pack_exact, pack_initials, syllable_first_letter, syllable_matches_digraph,
+    syllable_matches_unit, unit_first_letter, DagEdgeKind, SpanPron, SyllableId,
+};
 use crate::user_dict::PROTECTED_FUNCTION_WORDS;
 
 pub const MAGIC: &[u8; 8] = b"IMEMOD01";
@@ -25,6 +28,20 @@ pub struct LexTable {
     pub keys: Vec<u64>,
     pub ranges: Vec<u32>,
     pub entries: Vec<LexEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MixedLexEntry {
+    pub exact_key: u64,
+    pub word_id: u32,
+    pub reading_logp: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MixedLexTable {
+    pub keys: Vec<u64>,
+    pub ranges: Vec<u32>,
+    pub entries: Vec<MixedLexEntry>,
 }
 
 #[inline]
@@ -208,6 +225,7 @@ pub struct Model {
     word_index: WordIndex,
     /// Sorted by `word_id`: `(word_id, packed_exact_key, reading_logp)` for multi-char words (`len >= 2`).
     multi_word_readings: Vec<(u32, u64, f32)>,
+    mixed_lex: MixedLexTable,
     protected_fn_mask: Vec<u8>,
     user_oov_unigram_logp: f32,
 }
@@ -233,17 +251,73 @@ impl Model {
     ) -> Self {
         let word_index = WordIndex::build(&word_offsets, &word_bytes);
         let mut multi_word_readings = Vec::new();
+        let mut mixed_items: Vec<(u64, MixedLexEntry)> = Vec::new();
         for (key_idx, &key) in exact.keys.iter().enumerate() {
             let syl_len = ((key >> 54) & 0x7) as usize;
             if syl_len >= 2 {
                 let start = exact.ranges[key_idx] as usize;
                 let end = exact.ranges[key_idx + 1] as usize;
+                let init_key = if syl_len <= 4 {
+                    let mut letters = [0u8; 4];
+                    for (i, slot) in letters.iter_mut().enumerate().take(syl_len) {
+                        let sid = ((key >> (i * 9)) & 0x1ff) as SyllableId;
+                        *slot = syllable_first_letter(sid);
+                    }
+                    pack_initials(&letters[..syl_len])
+                } else {
+                    None
+                };
                 for entry in &exact.entries[start..end] {
                     multi_word_readings.push((entry.word_id, key, entry.reading_logp));
+                    if let Some(ik) = init_key {
+                        mixed_items.push((
+                            ik,
+                            MixedLexEntry {
+                                exact_key: key,
+                                word_id: entry.word_id,
+                                reading_logp: entry.reading_logp,
+                            },
+                        ));
+                    }
                 }
             }
         }
         multi_word_readings.sort_unstable_by_key(|x| x.0);
+
+        mixed_items.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| {
+                    let sa = unigram_logp.get(a.1.word_id as usize).copied().unwrap_or(-20.0)
+                        + a.1.reading_logp;
+                    let sb = unigram_logp.get(b.1.word_id as usize).copied().unwrap_or(-20.0)
+                        + b.1.reading_logp;
+                    sb.total_cmp(&sa)
+                })
+                .then_with(|| a.1.word_id.cmp(&b.1.word_id))
+        });
+
+        let mut mixed_keys = Vec::new();
+        let mut mixed_ranges = vec![0u32];
+        let mut mixed_entries = Vec::with_capacity(mixed_items.len());
+        let mut cur_init_key: Option<u64> = None;
+        for (init_key, entry) in mixed_items {
+            if cur_init_key != Some(init_key) {
+                if cur_init_key.is_some() {
+                    mixed_ranges.push(mixed_entries.len() as u32);
+                }
+                cur_init_key = Some(init_key);
+                mixed_keys.push(init_key);
+            }
+            mixed_entries.push(entry);
+        }
+        if cur_init_key.is_some() {
+            mixed_ranges.push(mixed_entries.len() as u32);
+        }
+        let mixed_lex = MixedLexTable {
+            keys: mixed_keys,
+            ranges: mixed_ranges,
+            entries: mixed_entries,
+        };
 
         let mut real_unis: Vec<f32> = unigram_logp
             .iter()
@@ -289,6 +363,7 @@ impl Model {
             trigram_logp,
             word_index,
             multi_word_readings,
+            mixed_lex,
             protected_fn_mask,
             user_oov_unigram_logp,
         }
@@ -350,6 +425,70 @@ impl Model {
             .get(letter_idx as usize)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub fn lookup_mixed(&self, units: &[DagEdgeKind], max_keep: usize, out: &mut Vec<LexEntry>) {
+        out.clear();
+        let len = units.len();
+        if !(2..=4).contains(&len) || max_keep == 0 {
+            return;
+        }
+        let mut letters = [0u8; 4];
+        let mut exact_mask = 0u64;
+        let mut exact_target = 0u64;
+        let mut has_digraph = false;
+        for (i, &unit) in units.iter().enumerate() {
+            letters[i] = unit_first_letter(unit);
+            match unit {
+                DagEdgeKind::Exact(sid) => {
+                    let shift = i * 9;
+                    exact_mask |= 0x1ff_u64 << shift;
+                    exact_target |= (sid as u64) << shift;
+                }
+                DagEdgeKind::Abbrev(_) => {}
+                DagEdgeKind::Abbrev2(_) => {
+                    has_digraph = true;
+                }
+            }
+        }
+        let Some(init_key) = pack_initials(&letters[..len]) else {
+            return;
+        };
+        let Some(idx) = binary_search_u64(&self.mixed_lex.keys, init_key) else {
+            return;
+        };
+        let start = self.mixed_lex.ranges[idx] as usize;
+        let end = self.mixed_lex.ranges[idx + 1] as usize;
+        for e in &self.mixed_lex.entries[start..end] {
+            if (e.exact_key & exact_mask) != exact_target {
+                continue;
+            }
+            if has_digraph {
+                let mut ok = true;
+                for (i, &unit) in units.iter().enumerate() {
+                    if let DagEdgeKind::Abbrev2(di) = unit {
+                        let sid = ((e.exact_key >> (i * 9)) & 0x1ff) as SyllableId;
+                        if !syllable_matches_digraph(sid, di) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+            }
+            if out.iter().any(|x| x.word_id == e.word_id) {
+                continue;
+            }
+            out.push(LexEntry {
+                word_id: e.word_id,
+                reading_logp: e.reading_logp,
+            });
+            if out.len() >= max_keep {
+                break;
+            }
+        }
     }
 
     #[inline]
@@ -542,6 +681,12 @@ impl Model {
                     total_len == tail_chars + slen
                         && (0..slen)
                             .all(|j| syllable_first_letter(word_syls[tail_chars + j]) == letters[j])
+                }
+                SpanPron::Mixed { len, units } => {
+                    let slen = len as usize;
+                    total_len == tail_chars + slen
+                        && (0..slen)
+                            .all(|j| syllable_matches_unit(word_syls[tail_chars + j], units[j]))
                 }
             };
             if matches {

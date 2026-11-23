@@ -20,7 +20,7 @@ fn compile_ico_resource(manifest_dir: &Path, res_name: &str) -> Option<PathBuf> 
         .parent()?
         .parent()?
         .join("assets")
-        .join("input_engine.ico");
+        .join("pyn.ico");
     println!("cargo:rerun-if-changed={}", ico_path.display());
     if !ico_path.is_file() {
         return None;

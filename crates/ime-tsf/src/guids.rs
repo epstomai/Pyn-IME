@@ -1,4 +1,4 @@
-//! Fixed and generation-versioned CLSID / TSF profile GUID constants for Input Engine.
+//! Fixed and generation-versioned CLSID / TSF profile GUID constants for Pyn.
 //!
 //! When deployed as `ime_tsf_gNNNN.dll` / `ime_tsf_x86_gNNNN.dll`, every GUID
 //! and candidate window class derives deterministically from the 4-hex generation
@@ -10,14 +10,14 @@ use windows_core::GUID;
 
 use crate::globals::dll_module_path;
 
-pub const CLSID_INPUT_ENGINE_TIP: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0101);
-pub const GUID_INPUT_ENGINE_PROFILE: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0102);
+pub const CLSID_PYN_TIP: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0101);
+pub const GUID_PYN_PROFILE: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0102);
 pub const GUID_DISPLAY_ATTR_INPUT: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0103);
 pub const GUID_PRESERVED_KEY_SHIFT: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0104);
 pub const GUID_PRESERVED_KEY_PUNCT: GUID = GUID::from_u128(0xa94e2c1b_7d3f_4e8a_9b12_6c5f8a3d0105);
 
 pub const LANGID_ZH_CN: u16 = 0x0804;
-pub const TIP_DISPLAY_NAME: &str = "Input Engine 拼音";
+pub const TIP_DISPLAY_NAME: &str = "Pyn 拼音";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TipGuids {
@@ -47,8 +47,8 @@ pub fn guids_for_generation(generation: u16) -> TipGuids {
     if generation == 0 {
         return TipGuids {
             generation: 0,
-            clsid: CLSID_INPUT_ENGINE_TIP,
-            profile: GUID_INPUT_ENGINE_PROFILE,
+            clsid: CLSID_PYN_TIP,
+            profile: GUID_PYN_PROFILE,
             display_attr_input: GUID_DISPLAY_ATTR_INPUT,
             preserved_key_shift: GUID_PRESERVED_KEY_SHIFT,
             preserved_key_punct: GUID_PRESERVED_KEY_PUNCT,
@@ -112,8 +112,8 @@ mod tests {
         assert_eq!(parse_generation_from_filename("ime_tsf_g12345"), 0);
 
         let g0 = guids_for_generation(0);
-        assert_eq!(g0.clsid, CLSID_INPUT_ENGINE_TIP);
-        assert_eq!(g0.profile, GUID_INPUT_ENGINE_PROFILE);
+        assert_eq!(g0.clsid, CLSID_PYN_TIP);
+        assert_eq!(g0.profile, GUID_PYN_PROFILE);
 
         let g1 = guids_for_generation(1);
         let g2 = guids_for_generation(2);

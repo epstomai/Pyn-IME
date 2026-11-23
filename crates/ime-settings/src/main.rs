@@ -1,4 +1,4 @@
-//! Native Vercel / Geist-styled GUI Settings application for Input Engine (`ime-settings.exe`).
+//! Native Vercel / Geist-styled GUI Settings application for Pyn (`ime-settings.exe`).
 //! Hot-reloads changes live to running `ime-server.exe` and `ime_tsf.dll` without app restarts.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
@@ -51,9 +51,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{BOOL, PCWSTR};
 
-const CLASS_NAME: &str = "InputEngineSettingsWnd";
-const WINDOW_TITLE: &str = "Input Engine 设置";
-const MUTEX_NAME: &str = r"Local\InputEngineSettingsMutex_v1";
+const CLASS_NAME: &str = "PynSettingsWnd";
+const WINDOW_TITLE: &str = "Pyn 设置";
+const MUTEX_NAME: &str = r"Local\PynSettingsMutex_v1";
 const LOGICAL_W: i32 = 580;
 const LOGICAL_H: i32 = 746;
 
@@ -882,7 +882,7 @@ unsafe fn render_settings_surface(
 
     // Header title + subtitle (y = 14..50)
     labels.push(PendingLabel {
-        text: "Input Engine".to_owned(),
+        text: "Pyn".to_owned(),
         rc: RECT {
             left: pad_x,
             top: px(14),

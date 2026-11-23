@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use crate::model::{ContextState, LexEntry, Model, EOS_ID, NONE_ID};
 use crate::pinyin::{
     build_dag, pack_abbrev_tail, pack_exact, pack_initials, DagEdgeKind, PinyinDag, SpanPron,
-    SyllableId,
 };
 use crate::reranker::Reranker;
 use crate::user_dict::{ActiveKeyMatch, UserMemory};
@@ -471,6 +470,7 @@ fn try_decode_single_unit(
                 SpanPron::AbbrevInit { len: 1, letters },
             )
         }
+        DagEdgeKind::Abbrev2(_) => return None,
     };
     if entries.is_empty() {
         return Some(DecodeOutcome::default());
@@ -622,15 +622,13 @@ fn collect_spans(
     user: Option<&UserMemory>,
     cfg: &DecoderConfig,
 ) -> (Vec<Vec<SpanEdge>>, Vec<String>) {
+    const MAX_EXACT_LEN: usize = 6;
+    const MAX_ABBREV_INIT_LEN: usize = 6;
+    const MAX_MIXED_LEN: usize = 4;
+
     let mut spans_to: Vec<Vec<SpanEdge>> = vec![Vec::new(); dag.len + 1];
     let mut oov_pool: Vec<String> = Vec::new();
-
-    #[derive(Clone, Copy)]
-    enum ChainState {
-        Empty,
-        AllExact { len: usize, syls: [SyllableId; 6] },
-        AllAbbrev { len: usize, letters: [u8; 6] },
-    }
+    let mut mixed_buf: Vec<LexEntry> = Vec::with_capacity(cfg.max_span_word);
 
     #[allow(clippy::too_many_arguments)]
     fn dfs(
@@ -640,7 +638,11 @@ fn collect_spans(
         cfg: &DecoderConfig,
         start: usize,
         pos: usize,
-        state: ChainState,
+        len: usize,
+        units: [DagEdgeKind; 6],
+        abbrev_count: u8,
+        has_abbrev2: bool,
+        mixed_buf: &mut Vec<LexEntry>,
         spans_to: &mut Vec<Vec<SpanEdge>>,
         oov_pool: &mut Vec<String>,
     ) {
@@ -648,26 +650,122 @@ fn collect_spans(
             return;
         }
         for edge in &dag.edges_from[pos] {
-            match (state, edge.kind) {
-                (ChainState::Empty, DagEdgeKind::Exact(syl)) => {
-                    if let Some(key) = pack_exact(&[syl]) {
-                        let entries = model.exact.lookup(key);
+            let is_single_abbrev = matches!(edge.kind, DagEdgeKind::Abbrev(_));
+            if len >= MAX_MIXED_LEN
+                && abbrev_count > 0
+                && !(abbrev_count == len as u8 && !has_abbrev2 && is_single_abbrev)
+            {
+                continue;
+            }
+            let next_len = len + 1;
+            let mut next_units = units;
+            next_units[len] = edge.kind;
+            let next_abbrev = abbrev_count + u8::from(!matches!(edge.kind, DagEdgeKind::Exact(_)));
+            let next_has_abbrev2 = has_abbrev2 || matches!(edge.kind, DagEdgeKind::Abbrev2(_));
+
+            if next_len == 1 {
+                match edge.kind {
+                    DagEdgeKind::Exact(syl) => {
+                        if let Some(key) = pack_exact(&[syl]) {
+                            let entries = model.exact.lookup(key);
+                            let mut one = [0; 6];
+                            one[0] = syl;
+                            push_spans(
+                                model,
+                                entries,
+                                &[],
+                                cfg.max_span_exact_char,
+                                start,
+                                edge.end,
+                                0,
+                                SpanPron::Exact { len: 1, syls: one },
+                                &mut spans_to[edge.end],
+                            );
+                        }
+                    }
+                    DagEdgeKind::Abbrev(letter) => {
+                        let entries = model.initial_entries(letter);
                         let mut one = [0; 6];
-                        one[0] = syl;
+                        one[0] = letter;
                         push_spans(
                             model,
                             entries,
                             &[],
-                            cfg.max_span_exact_char,
+                            cfg.max_span_abbrev_char,
                             start,
                             edge.end,
-                            0,
-                            SpanPron::Exact { len: 1, syls: one },
+                            1,
+                            SpanPron::AbbrevInit {
+                                len: 1,
+                                letters: one,
+                            },
                             &mut spans_to[edge.end],
                         );
                     }
-                    let mut syls = [0; 6];
-                    syls[0] = syl;
+                    // Digraph initials (zh/ch/sh) only participate in multi-char word spans.
+                    DagEdgeKind::Abbrev2(_) => {}
+                }
+                dfs(
+                    model,
+                    dag,
+                    user,
+                    cfg,
+                    start,
+                    edge.end,
+                    next_len,
+                    next_units,
+                    next_abbrev,
+                    next_has_abbrev2,
+                    mixed_buf,
+                    spans_to,
+                    oov_pool,
+                );
+                continue;
+            }
+
+            if next_abbrev == 0 {
+                let mut syls = [0; 6];
+                for (i, u) in next_units[..next_len].iter().enumerate() {
+                    if let DagEdgeKind::Exact(s) = *u {
+                        syls[i] = s;
+                    }
+                }
+                if let Some(key) = pack_exact(&syls[..next_len]) {
+                    let entries = model.exact.lookup(key);
+                    let user_matches = user
+                        .map(|u| u.active_entries_for_key(key))
+                        .unwrap_or_default();
+                    let pron = SpanPron::Exact {
+                        len: next_len as u8,
+                        syls,
+                    };
+                    push_spans(
+                        model,
+                        entries,
+                        &user_matches,
+                        cfg.max_span_word,
+                        start,
+                        edge.end,
+                        0,
+                        pron,
+                        &mut spans_to[edge.end],
+                    );
+                    for m in &user_matches {
+                        if m.is_oov && m.boost > 0.0 {
+                            let idx = oov_pool.len();
+                            oov_pool.push(m.word.clone());
+                            spans_to[edge.end].push(SpanEdge {
+                                start,
+                                word: SpanWord::UserOov(idx),
+                                reading_logp: 0.0,
+                                abbrev_count: 0,
+                                pron,
+                                user_boost: m.boost,
+                            });
+                        }
+                    }
+                }
+                if next_len < MAX_EXACT_LEN {
                     dfs(
                         model,
                         dag,
@@ -675,86 +773,40 @@ fn collect_spans(
                         cfg,
                         start,
                         edge.end,
-                        ChainState::AllExact { len: 1, syls },
+                        next_len,
+                        next_units,
+                        next_abbrev,
+                        next_has_abbrev2,
+                        mixed_buf,
                         spans_to,
                         oov_pool,
                     );
                 }
-                (ChainState::AllExact { len, mut syls }, DagEdgeKind::Exact(syl)) => {
-                    let next_len = len + 1;
-                    syls[len] = syl;
-                    if let Some(key) = pack_exact(&syls[..next_len]) {
-                        let entries = model.exact.lookup(key);
-                        let user_matches = user
-                            .map(|u| u.active_entries_for_key(key))
-                            .unwrap_or_default();
-                        let pron = SpanPron::Exact {
-                            len: next_len as u8,
-                            syls,
-                        };
-                        push_spans(
-                            model,
-                            entries,
-                            &user_matches,
-                            cfg.max_span_word,
-                            start,
-                            edge.end,
-                            0,
-                            pron,
-                            &mut spans_to[edge.end],
-                        );
-                        for m in &user_matches {
-                            if m.is_oov && m.boost > 0.0 {
-                                let idx = oov_pool.len();
-                                oov_pool.push(m.word.clone());
-                                spans_to[edge.end].push(SpanEdge {
-                                    start,
-                                    word: SpanWord::UserOov(idx),
-                                    reading_logp: 0.0,
-                                    abbrev_count: 0,
-                                    pron,
-                                    user_boost: m.boost,
-                                });
-                            }
-                        }
-                    }
-                    if next_len < 6 {
-                        dfs(
-                            model,
-                            dag,
-                            user,
-                            cfg,
-                            start,
-                            edge.end,
-                            ChainState::AllExact {
-                                len: next_len,
-                                syls,
-                            },
-                            spans_to,
-                            oov_pool,
-                        );
+            } else if next_abbrev == next_len as u8 && !next_has_abbrev2 {
+                let mut letters = [0; 6];
+                for (i, u) in next_units[..next_len].iter().enumerate() {
+                    if let DagEdgeKind::Abbrev(lt) = *u {
+                        letters[i] = lt;
                     }
                 }
-                (ChainState::Empty, DagEdgeKind::Abbrev(letter)) => {
-                    let entries = model.initial_entries(letter);
-                    let mut one = [0; 6];
-                    one[0] = letter;
+                if let Some(key) = pack_initials(&letters[..next_len]) {
+                    let entries = model.abbrev_init.lookup(key);
                     push_spans(
                         model,
                         entries,
                         &[],
-                        cfg.max_span_abbrev_char,
+                        cfg.max_span_word,
                         start,
                         edge.end,
-                        1,
+                        next_abbrev,
                         SpanPron::AbbrevInit {
-                            len: 1,
-                            letters: one,
+                            len: next_len as u8,
+                            letters,
                         },
                         &mut spans_to[edge.end],
                     );
-                    let mut letters = [0; 6];
-                    letters[0] = letter;
+                }
+                if next_len < MAX_ABBREV_INIT_LEN {
                     dfs(
                         model,
                         dag,
@@ -762,16 +814,25 @@ fn collect_spans(
                         cfg,
                         start,
                         edge.end,
-                        ChainState::AllAbbrev { len: 1, letters },
+                        next_len,
+                        next_units,
+                        next_abbrev,
+                        next_has_abbrev2,
+                        mixed_buf,
                         spans_to,
                         oov_pool,
                     );
                 }
-                (ChainState::AllExact { len, syls }, DagEdgeKind::Abbrev(letter)) => {
-                    if let Some(key) = pack_abbrev_tail(&syls[..len], letter) {
+            } else if next_abbrev == 1 && is_single_abbrev {
+                if let DagEdgeKind::Abbrev(letter) = edge.kind {
+                    let mut prefix = [0; 5];
+                    for (i, u) in next_units[..len].iter().enumerate() {
+                        if let DagEdgeKind::Exact(s) = *u {
+                            prefix[i] = s;
+                        }
+                    }
+                    if let Some(key) = pack_abbrev_tail(&prefix[..len], letter) {
                         let entries = model.abbrev_tail.lookup(key);
-                        let mut prefix = [0; 5];
-                        prefix[..len].copy_from_slice(&syls[..len]);
                         push_spans(
                             model,
                             entries,
@@ -789,48 +850,61 @@ fn collect_spans(
                         );
                     }
                 }
-                (ChainState::AllAbbrev { len, mut letters }, DagEdgeKind::Abbrev(letter)) => {
-                    let next_len = len + 1;
-                    letters[len] = letter;
-                    if let Some(key) = pack_initials(&letters[..next_len]) {
-                        let entries = model.abbrev_init.lookup(key);
-                        push_spans(
-                            model,
-                            entries,
-                            &[],
-                            cfg.max_span_word,
-                            start,
-                            edge.end,
-                            next_len as u8,
-                            SpanPron::AbbrevInit {
-                                len: next_len as u8,
-                                letters,
-                            },
-                            &mut spans_to[edge.end],
-                        );
-                    }
-                    if next_len < 6 {
-                        dfs(
-                            model,
-                            dag,
-                            user,
-                            cfg,
-                            start,
-                            edge.end,
-                            ChainState::AllAbbrev {
-                                len: next_len,
-                                letters,
-                            },
-                            spans_to,
-                            oov_pool,
-                        );
-                    }
+                if next_len < MAX_MIXED_LEN {
+                    dfs(
+                        model,
+                        dag,
+                        user,
+                        cfg,
+                        start,
+                        edge.end,
+                        next_len,
+                        next_units,
+                        next_abbrev,
+                        next_has_abbrev2,
+                        mixed_buf,
+                        spans_to,
+                        oov_pool,
+                    );
                 }
-                (ChainState::AllAbbrev { .. }, DagEdgeKind::Exact(_)) => {}
+            } else if next_len <= MAX_MIXED_LEN {
+                model.lookup_mixed(&next_units[..next_len], cfg.max_span_word, mixed_buf);
+                push_spans(
+                    model,
+                    mixed_buf,
+                    &[],
+                    cfg.max_span_word,
+                    start,
+                    edge.end,
+                    next_abbrev,
+                    SpanPron::Mixed {
+                        len: next_len as u8,
+                        units: next_units,
+                    },
+                    &mut spans_to[edge.end],
+                );
+                if next_len < MAX_MIXED_LEN {
+                    dfs(
+                        model,
+                        dag,
+                        user,
+                        cfg,
+                        start,
+                        edge.end,
+                        next_len,
+                        next_units,
+                        next_abbrev,
+                        next_has_abbrev2,
+                        mixed_buf,
+                        spans_to,
+                        oov_pool,
+                    );
+                }
             }
         }
     }
 
+    let init_units = [DagEdgeKind::Abbrev(0); 6];
     for start in 0..dag.len {
         dfs(
             model,
@@ -839,7 +913,11 @@ fn collect_spans(
             cfg,
             start,
             start,
-            ChainState::Empty,
+            0,
+            init_units,
+            0,
+            false,
+            &mut mixed_buf,
             &mut spans_to,
             &mut oov_pool,
         );

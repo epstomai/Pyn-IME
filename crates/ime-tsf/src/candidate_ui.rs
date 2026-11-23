@@ -49,9 +49,9 @@ fn window_class_name() -> &'static str {
         .get_or_init(|| {
             let gen = active_guids().generation;
             if gen == 0 {
-                "InputEngineCandidateWnd".to_owned()
+                "PynCandidateWnd".to_owned()
             } else {
-                format!("InputEngineCandidateWnd_g{gen:04x}")
+                format!("PynCandidateWnd_g{gen:04x}")
             }
         })
         .as_str()
@@ -375,7 +375,7 @@ impl CandidateWindow {
         });
 
         let class_w = to_wide_null(class_name);
-        let title_w = to_wide_null("Input Engine");
+        let title_w = to_wide_null("Pyn");
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,

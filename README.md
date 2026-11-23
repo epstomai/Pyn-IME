@@ -1,11 +1,11 @@
-# Input Engine
+# Pyn
 
 一个以「少猜错」为目标的中文拼音输入法：Windows 平台、Rust 自研引擎、
 n-gram 实时解码加小型神经网络重排。
 
 当前处于第 5 期增强状态：在 **`ime-v4`** 核心解码器（`2.21 亿`汉字 KN 三元模型 + 混合精度 `W8A8 AVX-VNNI + F32 w_down` 神经重排器 + 受护增量自学习 `IMEUSR01`）之上，已完成 **Windows TSF 双架构输入法外壳与配置界面（`ime-v5`）**：
-- 双进程与双架构分离：**`ime_tsf_gNNNN.dll`**（`643.0 KiB`, x64）与 **`ime_tsf_x86_gNNNN.dll`**（`533.5 KiB`, x86 WOW64，兼容 32 位 QQ 与旧 Win32/CUAS 应用）作为轻量 COM 进程内文本服务，提供 **Vercel / Geist 极简黑白风格** DPI 自适应深浅色圆角悬浮候选框（支持**横排 / 竖排**布局、SDF 抗锯齿胶囊、Windows 11 原生 `DWMWA_BORDER_COLOR` 细边、现代中文字体自动优选 `MiSans` / `OPPO Sans 4.0` / `HarmonyOS Sans SC` / `Noto Sans SC` / `思源黑体` 等，以及默认 `Regular 400` 字重 + `Subtle` 极简微抬升边框高亮）、**代际版本化零重启热切换**（`install_tsf.py deploy` 自动递增代际并派生独立 CLSID/Profile/窗口类，通过 `InstallLayoutOrTip` 切换激活并卸载清理旧代际，已打开应用无需重启即可加载新版 DLL）、**首字母大写 `Shift+A–Z` 直接入窗组合**、**打字中途或空闲单击 `Shift` 切换中/英**（通过 TSF `PreserveKey(VK_SHIFT, TF_MOD_ON_KEYUP)` + `OnPreservedKey`/`OnTestKeyUp`/`OnKeyUp` 兼容 Windows 11 / Chromium / Electron）、**`Ctrl + .` 切换中/英文标点**（`中.` 状态直出半角英文符号且无需切出中文输入法）、以及跨应用 32 字上下文读取；通过 `Low-IL + AppContainer` 兼容 Named Pipe `\\.\pipe\InputEngineTSF_v1` 连接共享守护进程 **`ime-server.exe`**（`878.0 KiB`），全系统仅加载一份约 180 MB 模型并统一安全自学习；
-- 独立配置界面 **`ime-settings.exe`**（`452.0 KiB`）：同样采用原生 Vercel / Geist 界面风格，提供实时预览舞台、主题/布局/高亮样式/字体/字号/首选字重/候选数量与输入行为开关；修改自动原子持久化至 `%LOCALAPPDATA%\InputEngine\config.json` 并经 Named Pipe（`GetConfig` / `SetConfig` + `config_revision`）实时热同步到所有运行中的 `ime_tsf*.dll` 实例，部署时自动创建开始菜单快捷方式 `Input Engine 设置`；
+- 双进程与双架构分离：**`ime_tsf_gNNNN.dll`**（`643.0 KiB`, x64）与 **`ime_tsf_x86_gNNNN.dll`**（`533.5 KiB`, x86 WOW64，兼容 32 位 QQ 与旧 Win32/CUAS 应用）作为轻量 COM 进程内文本服务，提供 **Vercel / Geist 极简黑白风格** DPI 自适应深浅色圆角悬浮候选框（支持**横排 / 竖排**布局、SDF 抗锯齿胶囊、Windows 11 原生 `DWMWA_BORDER_COLOR` 细边、现代中文字体自动优选 `MiSans` / `OPPO Sans 4.0` / `HarmonyOS Sans SC` / `Noto Sans SC` / `思源黑体` 等，以及默认 `Regular 400` 字重 + `Subtle` 极简微抬升边框高亮）、**代际版本化零重启热切换**（`install_tsf.py deploy` 自动递增代际并派生独立 CLSID/Profile/窗口类，通过 `InstallLayoutOrTip` 切换激活并卸载清理旧代际，已打开应用无需重启即可加载新版 DLL）、**首字母大写 `Shift+A–Z` 直接入窗组合**、**打字中途或空闲单击 `Shift` 切换中/英**（通过 TSF `PreserveKey(VK_SHIFT, TF_MOD_ON_KEYUP)` + `OnPreservedKey`/`OnTestKeyUp`/`OnKeyUp` 兼容 Windows 11 / Chromium / Electron）、**`Ctrl + .` 切换中/英文标点**（`中.` 状态直出半角英文符号且无需切出中文输入法）、以及跨应用 32 字上下文读取；通过 `Low-IL + AppContainer` 兼容 Named Pipe `\\.\pipe\PynTSF_v1` 连接共享守护进程 **`ime-server.exe`**（`878.0 KiB`），全系统仅加载一份约 180 MB 模型并统一安全自学习；
+- 独立配置界面 **`ime-settings.exe`**（`452.0 KiB`）：同样采用原生 Vercel / Geist 界面风格，提供实时预览舞台、主题/布局/高亮样式/字体/字号/首选字重/候选数量与输入行为开关；修改自动原子持久化至 `%LOCALAPPDATA%\Pyn\config.json` 并经 Named Pipe（`GetConfig` / `SetConfig` + `config_revision`）实时热同步到所有运行中的 `ime_tsf*.dll` 实例，部署时自动创建开始菜单快捷方式 `Pyn 设置`；
 - Pure-CPU 极致延迟：`run_eval.py` 全量评测单次 `convert` 延迟 **`p50 1.19 ms`、`p95 2.74 ms`、`max 6.33 ms`**；实测 Named Pipe 40 次实时往返采样 **`p50 1.111 ms`、`p95 2.257 ms`、`max 2.885 ms`**；
 - 在开启受护自学习下保持全部 `13` 个污染场景 **`0` 回归**、门禁干净通过 **`828 / 830`**、`general` `heldout` **`76.80%` / `CER 4.55%`**、`de_grammar` `heldout` **`85.71%`**。
 
@@ -15,7 +15,7 @@ n-gram 实时解码加小型神经网络重排。
 |---|---|
 | `crates/ime-core` | 零依赖纯 Rust 引擎核心（无分支查表、DAG + arena Beam Search、混合精度 `IMERER01` AVX2/AVX-VNNI + Prefix KV 缓存重排、`IMEUSR01` 受护用户自学习） |
 | `crates/ime-ipc` | 长度前缀 JSON IPC 协议（含 `GetConfig`/`SetConfig` 热同步）、配置模型 `config.rs`、Win32 Named Pipe 传输层、英文词表前缀补全与状态机 `SessionController` |
-| `crates/ime-server` | Windows 单实例本地推理、共享自学习与配置同步守护进程（`ime-server.exe`，原子持久化 `%LOCALAPPDATA%\InputEngine\user_dict.tsv` 与 `config.json`） |
+| `crates/ime-server` | Windows 单实例本地推理、共享自学习与配置同步守护进程（`ime-server.exe`，原子持久化 `%LOCALAPPDATA%\Pyn\user_dict.tsv` 与 `config.json`） |
 | `crates/ime-tsf` | Windows TSF x64/x86 双架构 COM 进程内 DLL（`ITfTextInputProcessorEx`、`ITfCompartmentEventSink` 双向同步与 DPI 自适应横排/竖排 GDI 悬浮候选窗） |
 | `crates/ime-settings` | 原生 Win32 DPI 自适应 Vercel/Geist 风格 GUI 设置程序（`ime-settings.exe`，1:1 候选窗实时预览、现代字体选择与热生效配置下发） |
 | `crates/ime-train` | 离线训练工具：导入万象词库与清洗语料，训练并导出 `models/ime_model.bin` |

@@ -37,6 +37,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ime-settings"
+version = "0.1.0"
+dependencies = [
+ "ime-ipc",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "ime-train"
 version = "0.1.0"
 dependencies = [

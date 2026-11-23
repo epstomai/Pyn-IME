@@ -13,19 +13,18 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
-    GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
-    GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, GUID_TFCAT_TIPCAP_SECUREMODE,
-    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIPCAP_UIELEMENTENABLED, GUID_TFCAT_TIP_KEYBOARD,
-    ITfCategoryMgr, ITfInputProcessorProfileMgr,
+    CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, CLSID_TF_ThreadMgr,
+    GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, GUID_TFCAT_TIPCAP_COMLESS,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+    GUID_TFCAT_TIPCAP_SECUREMODE, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED, GUID_TFCAT_TIP_KEYBOARD, ITfCategoryMgr,
+    ITfInputProcessorProfileMgr, ITfThreadMgr, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
+    TF_IPPMF_ENABLEPROFILE, TF_IPPMF_FORSESSION, TF_PROFILETYPE_INPUTPROCESSOR,
 };
 use windows_core::{Error, GUID, HRESULT, PCWSTR};
 
 use crate::globals::dll_module_path;
-use crate::guids::{
-    guid_to_braced_string, CLSID_INPUT_ENGINE_TIP, GUID_INPUT_ENGINE_PROFILE, LANGID_ZH_CN,
-    TIP_DISPLAY_NAME,
-};
+use crate::guids::{active_guids, guid_to_braced_string, LANGID_ZH_CN, TIP_DISPLAY_NAME};
 
 const CATEGORIES: [&GUID; 8] = [
     &GUID_TFCAT_TIP_KEYBOARD,
@@ -55,8 +54,8 @@ fn set_reg_sz(hkey: HKEY, name: Option<&str>, value: &str) -> windows_core::Resu
     }
 }
 
-fn write_clsid_registry(dll_path: &str) -> windows_core::Result<()> {
-    let clsid_str = guid_to_braced_string(&CLSID_INPUT_ENGINE_TIP);
+fn write_clsid_registry(clsid: &GUID, dll_path: &str) -> windows_core::Result<()> {
+    let clsid_str = guid_to_braced_string(clsid);
     let subkey = format!("SOFTWARE\\Classes\\CLSID\\{clsid_str}");
     let w_sub = to_wide_null(&subkey);
     let mut hkey = HKEY::default();
@@ -109,8 +108,8 @@ fn write_clsid_registry(dll_path: &str) -> windows_core::Result<()> {
     res1.and(res2)
 }
 
-fn delete_clsid_registry() {
-    let clsid_str = guid_to_braced_string(&CLSID_INPUT_ENGINE_TIP);
+fn delete_clsid_registry(clsid: &GUID) {
+    let clsid_str = guid_to_braced_string(clsid);
     let subkey = format!("SOFTWARE\\Classes\\CLSID\\{clsid_str}");
     let w_sub = to_wide_null(&subkey);
     unsafe {
@@ -147,9 +146,10 @@ impl Drop for ComScope {
 }
 
 pub fn register_server() -> windows_core::Result<()> {
+    let g = active_guids();
     let dll_path = dll_module_path().ok_or_else(|| Error::from(E_FAIL))?;
     let dll_str = dll_path.to_string_lossy();
-    write_clsid_registry(&dll_str)?;
+    write_clsid_registry(&g.clsid, &dll_str)?;
 
     let _com = ComScope::enter()?;
 
@@ -162,9 +162,9 @@ pub fn register_server() -> windows_core::Result<()> {
     // Passing TF_IPP_CAPS_UIELEMENTENABLED (0x4) collides with TF_RP_LOCALPROCESS and suppresses HKLM persistence.
     unsafe {
         profile_mgr.RegisterProfile(
-            &CLSID_INPUT_ENGINE_TIP,
+            &g.clsid,
             LANGID_ZH_CN,
-            &GUID_INPUT_ENGINE_PROFILE,
+            &g.profile,
             &desc_w,
             &icon_w,
             0,
@@ -179,24 +179,64 @@ pub fn register_server() -> windows_core::Result<()> {
         unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
     for &cat in &CATEGORIES {
         unsafe {
-            cat_mgr.RegisterCategory(&CLSID_INPUT_ENGINE_TIP, cat, &CLSID_INPUT_ENGINE_TIP)?;
+            cat_mgr.RegisterCategory(&g.clsid, cat, &g.clsid)?;
         }
     }
     Ok(())
 }
 
+pub fn activate_profile_for_session() -> windows_core::Result<()> {
+    let g = active_guids();
+    let _com = ComScope::enter()?;
+
+    let tm_activated: Option<ITfThreadMgr> = unsafe {
+        CoCreateInstance::<_, ITfThreadMgr>(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
+            .ok()
+            .and_then(|tm| if tm.Activate().is_ok() { Some(tm) } else { None })
+    };
+
+    let profile_mgr: ITfInputProcessorProfileMgr =
+        unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)? };
+
+    let flag_attempts = [
+        TF_IPPMF_FORSESSION | TF_IPPMF_ENABLEPROFILE | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
+        TF_IPPMF_FORSESSION | TF_IPPMF_ENABLEPROFILE,
+        TF_IPPMF_FORSESSION,
+    ];
+    let mut res = Ok(());
+    for flags in flag_attempts {
+        res = unsafe {
+            profile_mgr.ActivateProfile(
+                TF_PROFILETYPE_INPUTPROCESSOR,
+                LANGID_ZH_CN,
+                &g.clsid,
+                &g.profile,
+                HKL(null_mut()),
+                flags,
+            )
+        };
+        if res.is_ok() {
+            break;
+        }
+    }
+
+    if let Some(tm) = tm_activated {
+        unsafe {
+            let _ = tm.Deactivate();
+        }
+    }
+    res
+}
+
 pub fn unregister_server() -> windows_core::Result<()> {
+    let g = active_guids();
     let _com = ComScope::enter()?;
     if let Ok(cat_mgr) =
         unsafe { CoCreateInstance::<_, ITfCategoryMgr>(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER) }
     {
         for &cat in &CATEGORIES {
             unsafe {
-                let _ = cat_mgr.UnregisterCategory(
-                    &CLSID_INPUT_ENGINE_TIP,
-                    cat,
-                    &CLSID_INPUT_ENGINE_TIP,
-                );
+                let _ = cat_mgr.UnregisterCategory(&g.clsid, cat, &g.clsid);
             }
         }
     }
@@ -208,14 +248,9 @@ pub fn unregister_server() -> windows_core::Result<()> {
         )
     } {
         unsafe {
-            let _ = profile_mgr.UnregisterProfile(
-                &CLSID_INPUT_ENGINE_TIP,
-                LANGID_ZH_CN,
-                &GUID_INPUT_ENGINE_PROFILE,
-                0,
-            );
+            let _ = profile_mgr.UnregisterProfile(&g.clsid, LANGID_ZH_CN, &g.profile, 0);
         }
     }
-    delete_clsid_registry();
+    delete_clsid_registry(&g.clsid);
     Ok(())
 }

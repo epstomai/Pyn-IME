@@ -1,5 +1,6 @@
 //! Pure-Rust IME composing and key-dispatch state machine shared by the TSF shell and tests.
 
+use crate::config::ImeConfig;
 use crate::english::suggest_english_candidates;
 
 const MAX_KEYS_LEN: usize = 64;
@@ -57,12 +58,16 @@ pub enum KeyAction {
 #[derive(Debug, Clone)]
 pub struct SessionController {
     mode: InputMode,
+    chinese_punct: bool,
+    shift_toggle_enabled: bool,
+    initial_upper_english: bool,
     page_size: usize,
     keys: String,
     candidates: Vec<String>,
     selected: usize,
     just_committed_chinese: bool,
     shift_pending_tap: bool,
+    shift_combo_used: bool,
     open_double_quote: bool,
     open_single_quote: bool,
 }
@@ -77,14 +82,53 @@ impl SessionController {
     pub fn new() -> Self {
         Self {
             mode: InputMode::Chinese,
+            chinese_punct: true,
+            shift_toggle_enabled: true,
+            initial_upper_english: true,
             page_size: 5,
             keys: String::new(),
             candidates: Vec::new(),
             selected: 0,
             just_committed_chinese: false,
             shift_pending_tap: false,
+            shift_combo_used: false,
             open_double_quote: true,
             open_single_quote: true,
+        }
+    }
+
+    pub fn set_page_size(&mut self, size: usize) {
+        self.page_size = size.clamp(3, 9);
+    }
+
+    pub fn set_shift_toggle_enabled(&mut self, enabled: bool) {
+        self.shift_toggle_enabled = enabled;
+        if !enabled {
+            self.shift_pending_tap = false;
+            self.shift_combo_used = false;
+        }
+    }
+
+    pub fn shift_toggle_enabled(&self) -> bool {
+        self.shift_toggle_enabled
+    }
+
+    pub fn set_initial_upper_english(&mut self, enabled: bool) {
+        self.initial_upper_english = enabled;
+    }
+
+    pub fn initial_upper_english(&self) -> bool {
+        self.initial_upper_english
+    }
+
+    pub fn apply_config(&mut self, cfg: &ImeConfig, prev: Option<&ImeConfig>) {
+        self.set_page_size(cfg.page_size);
+        self.set_shift_toggle_enabled(cfg.shift_toggle);
+        self.set_initial_upper_english(cfg.initial_upper_english);
+        if prev.is_none()
+            || prev.is_some_and(|p| p.default_chinese_punct != cfg.default_chinese_punct)
+        {
+            self.set_chinese_punct(cfg.default_chinese_punct);
         }
     }
 
@@ -95,9 +139,23 @@ impl SessionController {
     pub fn set_mode(&mut self, mode: InputMode) {
         self.mode = mode;
         self.shift_pending_tap = false;
+        self.shift_combo_used = false;
         if self.is_composing() && mode == InputMode::English {
             self.refresh_english_candidates();
         }
+    }
+
+    pub fn chinese_punct(&self) -> bool {
+        self.chinese_punct
+    }
+
+    pub fn set_chinese_punct(&mut self, enabled: bool) {
+        self.chinese_punct = enabled;
+    }
+
+    pub fn toggle_chinese_punct(&mut self) -> bool {
+        self.chinese_punct = !self.chinese_punct;
+        self.chinese_punct
     }
 
     pub fn is_composing(&self) -> bool {
@@ -159,21 +217,44 @@ impl SessionController {
     }
 
     /// Updates pending Shift-tap tracking during `OnTestKeyDown` so combos like `Shift+A`
-    /// never toggle Chinese/English.
+    /// or key-repeat `Shift` holds never toggle Chinese/English.
     pub fn note_test_key(&mut self, event: KeyEvent, mods: KeyModifiers) {
+        self.note_test_key_with_repeat(event, mods, false);
+    }
+
+    pub fn note_test_key_with_repeat(&mut self, event: KeyEvent, mods: KeyModifiers, is_repeat: bool) {
         if mods.ctrl || mods.alt || mods.win {
             self.shift_pending_tap = false;
+            self.shift_combo_used = mods.shift;
             return;
         }
         match event {
             KeyEvent::ShiftDown => {
-                self.shift_pending_tap = true;
+                if !is_repeat {
+                    self.shift_pending_tap = true;
+                    self.shift_combo_used = false;
+                }
             }
             KeyEvent::ShiftUp => {}
             _ => {
                 self.shift_pending_tap = false;
+                self.shift_combo_used = mods.shift;
             }
         }
+    }
+
+    /// Handles a TSF `OnPreservedKey(VK_SHIFT, TF_MOD_ON_KEYUP)` release callback.
+    /// Fires even if the host app skipped `OnTestKeyDown(VK_SHIFT)`, while rejecting any
+    /// Shift release that participated in a key combo (`Shift+A`, `Shift+(`, `Ctrl+Shift`, etc.).
+    pub fn take_preserved_shift_tap(&mut self) -> Option<KeyAction> {
+        let combo = self.shift_combo_used;
+        self.shift_combo_used = false;
+        if combo || !self.shift_toggle_enabled {
+            self.shift_pending_tap = false;
+            return None;
+        }
+        self.shift_pending_tap = true;
+        Some(self.handle_key(KeyEvent::ShiftUp, KeyModifiers::default()))
     }
 
     /// Non-mutating predicate for `ITfKeyEventSink::OnTestKeyDown`.
@@ -209,7 +290,8 @@ impl SessionController {
         if self.mode == InputMode::Chinese {
             match event {
                 KeyEvent::Char('a'..='z') if !mods.shift => true,
-                KeyEvent::Char(ch) if is_mapped_punct(ch) => true,
+                KeyEvent::UpperChar('A'..='Z') if self.initial_upper_english => true,
+                KeyEvent::Char(ch) if self.chinese_punct && is_mapped_punct(ch) => true,
                 _ => false,
             }
         } else {
@@ -220,6 +302,7 @@ impl SessionController {
     pub fn handle_key(&mut self, event: KeyEvent, mods: KeyModifiers) -> KeyAction {
         if mods.ctrl || mods.alt || mods.win {
             self.shift_pending_tap = false;
+            self.shift_combo_used = mods.shift;
             self.just_committed_chinese = false;
             return KeyAction::PassThrough;
         }
@@ -227,34 +310,40 @@ impl SessionController {
         match event {
             KeyEvent::ShiftDown => {
                 self.shift_pending_tap = true;
+                self.shift_combo_used = false;
                 return KeyAction::PassThrough;
             }
             KeyEvent::ShiftUp => {
-                if !self.shift_pending_tap {
+                self.shift_combo_used = false;
+                if !self.shift_pending_tap || !self.shift_toggle_enabled {
+                    self.shift_pending_tap = false;
                     return KeyAction::PassThrough;
                 }
                 self.shift_pending_tap = false;
-                self.mode = match self.mode {
-                    InputMode::Chinese => InputMode::English,
-                    InputMode::English => InputMode::Chinese,
-                };
                 if self.is_composing() {
-                    if self.mode == InputMode::English {
-                        self.refresh_english_candidates();
-                        return KeyAction::UpdateComposition {
-                            need_convert: false,
-                        };
-                    } else {
+                    if self.is_english_composing() {
+                        self.mode = InputMode::Chinese;
                         self.keys.make_ascii_lowercase();
                         self.candidates.clear();
                         self.selected = 0;
                         return KeyAction::UpdateComposition { need_convert: true };
+                    } else {
+                        self.mode = InputMode::English;
+                        self.refresh_english_candidates();
+                        return KeyAction::UpdateComposition {
+                            need_convert: false,
+                        };
                     }
                 }
+                self.mode = match self.mode {
+                    InputMode::Chinese => InputMode::English,
+                    InputMode::English => InputMode::Chinese,
+                };
                 return KeyAction::ConsumedNoChange;
             }
             _ => {
                 self.shift_pending_tap = false;
+                self.shift_combo_used = mods.shift;
             }
         }
 
@@ -277,7 +366,14 @@ impl SessionController {
                     self.selected = 0;
                     KeyAction::UpdateComposition { need_convert: true }
                 }
-                KeyEvent::Char(ch) if is_mapped_punct(ch) => {
+                KeyEvent::UpperChar(ch @ 'A'..='Z') if self.initial_upper_english => {
+                    self.keys.push(ch);
+                    self.refresh_english_candidates();
+                    KeyAction::UpdateComposition {
+                        need_convert: false,
+                    }
+                }
+                KeyEvent::Char(ch) if self.chinese_punct && is_mapped_punct(ch) => {
                     if let Some(mapped) = self.map_punct(ch) {
                         KeyAction::Commit {
                             text: mapped.to_owned(),
@@ -502,7 +598,11 @@ impl SessionController {
                         learn_text: None,
                     };
                 }
-                let punct = self.map_punct(ch).unwrap_or("");
+                let punct_owned = if self.chinese_punct {
+                    self.map_punct(ch).unwrap_or("").to_owned()
+                } else {
+                    ch.to_string()
+                };
                 let picked = self.candidates.get(self.selected).cloned();
                 let raw = self.take_composing_reset(false);
                 match picked {
@@ -513,13 +613,13 @@ impl SessionController {
                             (Some(raw), Some(cand.clone()))
                         };
                         KeyAction::Commit {
-                            text: format!("{cand}{punct}"),
+                            text: format!("{cand}{punct_owned}"),
                             learn_keys,
                             learn_text,
                         }
                     }
                     None => KeyAction::Commit {
-                        text: format!("{raw}{punct}"),
+                        text: format!("{raw}{punct_owned}"),
                         learn_keys: None,
                         learn_text: None,
                     },
@@ -562,6 +662,7 @@ impl SessionController {
         self.reset_composing();
         self.just_committed_chinese = false;
         self.shift_pending_tap = false;
+        self.shift_combo_used = false;
     }
 
     pub fn commit_raw_for_passthrough(&mut self) -> Option<String> {

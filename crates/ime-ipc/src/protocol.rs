@@ -30,6 +30,10 @@ pub enum IpcRequest {
     ResetSession {
         session_id: u64,
     },
+    GetConfig,
+    SetConfig {
+        config: crate::config::ImeConfig,
+    },
     Stats,
     Shutdown,
 }
@@ -46,6 +50,12 @@ pub enum IpcResponse {
     Candidates {
         candidates: Vec<String>,
         latency_ms: f32,
+        #[serde(default)]
+        config_revision: u64,
+    },
+    Config {
+        config: crate::config::ImeConfig,
+        revision: u64,
     },
     Ack {
         ok: bool,

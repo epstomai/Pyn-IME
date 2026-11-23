@@ -9,14 +9,14 @@ use windows::Win32::UI::TextServices::{
 };
 use windows_core::{implement, BOOL, BSTR, Error, GUID, Result};
 
-use crate::guids::GUID_DISPLAY_ATTR_INPUT;
+use crate::guids::active_guids;
 
 #[implement(ITfDisplayAttributeInfo)]
 pub struct InputDisplayAttributeInfo;
 
 impl ITfDisplayAttributeInfo_Impl for InputDisplayAttributeInfo_Impl {
     fn GetGUID(&self) -> Result<GUID> {
-        Ok(GUID_DISPLAY_ATTR_INPUT)
+        Ok(active_guids().display_attr_input)
     }
 
     fn GetDescription(&self) -> Result<BSTR> {

@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use ime_ipc::config::ImeConfig;
 use ime_ipc::pipe::{spawn_server_detached, NamedPipeClient};
 use ime_ipc::protocol::{IpcRequest, IpcResponse, DEFAULT_PIPE_NAME};
 use ime_ipc::session::{InputMode, KeyAction, KeyEvent, KeyModifiers, SessionController};
@@ -14,22 +15,23 @@ use windows::Win32::System::Variant::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DIVIDE, VK_DOWN,
-    VK_ESCAPE, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT,
-    VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
-    VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
-    VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SPACE,
-    VK_SUBTRACT, VK_TAB, VK_UP,
+    VK_ESCAPE, VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3,
+    VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+    VK_OEM_PLUS, VK_PRIOR, VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
+    VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
     GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, IEnumTfDisplayAttributeInfo, ITfCategoryMgr,
-    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
-    ITfDisplayAttributeInfo, ITfDisplayAttributeProvider, ITfDisplayAttributeProvider_Impl,
-    ITfDocumentMgr, ITfEditSession, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfSource, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
-    ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
-    TF_CONVERSIONMODE_NATIVE, TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_INVALID_COOKIE,
+    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition,
+    ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfDisplayAttributeInfo,
+    ITfDisplayAttributeProvider, ITfDisplayAttributeProvider_Impl, ITfDocumentMgr, ITfEditSession,
+    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfSource, ITfTextInputProcessorEx,
+    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_CONVERSIONMODE_NATIVE,
+    TF_CONVERSIONMODE_SYMBOL, TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_INVALID_COOKIE, TF_MOD_CONTROL, TF_MOD_ON_KEYUP, TF_PRESERVEDKEY,
 };
 use windows_core::{implement, BOOL, Error, GUID, IUnknownImpl, Interface, Ref, Result};
 
@@ -40,7 +42,17 @@ use crate::edit_session::{
     UpdateCompositionSession,
 };
 use crate::globals::{dll_add_ref, dll_module_path, dll_release, next_session_id};
-use crate::guids::GUID_DISPLAY_ATTR_INPUT;
+use crate::guids::active_guids;
+
+const PRESERVED_KEY_SHIFT: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
+    uVKey: VK_SHIFT.0 as u32,
+    uModifiers: TF_MOD_ON_KEYUP,
+};
+
+const PRESERVED_KEY_PUNCT: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
+    uVKey: VK_OEM_PERIOD.0 as u32,
+    uModifiers: TF_MOD_CONTROL,
+};
 
 fn request_edit_session_failed(res: &Result<windows_core::HRESULT>) -> bool {
     match res {
@@ -75,6 +87,9 @@ struct TextServiceState {
     syncing_compartment: bool,
     composition: Rc<RefCell<Option<ITfComposition>>>,
     display_attr_atom: u32,
+    config: ImeConfig,
+    config_revision: u64,
+    last_config_poll: Option<Instant>,
     session: SessionController,
     last_test_key: Option<(usize, KeyEvent, KeyModifiers)>,
     pipe: Option<NamedPipeClient>,
@@ -86,6 +101,9 @@ struct TextServiceState {
 
 impl TextServiceState {
     fn new() -> Self {
+        let config = ImeConfig::load_from(&ImeConfig::default_config_path());
+        let mut session = SessionController::new();
+        session.apply_config(&config, None);
         Self {
             tid: 0,
             session_id: next_session_id(),
@@ -95,7 +113,10 @@ impl TextServiceState {
             syncing_compartment: false,
             composition: Rc::new(RefCell::new(None)),
             display_attr_atom: 0,
-            session: SessionController::new(),
+            config,
+            config_revision: 0,
+            last_config_poll: None,
+            session,
             last_test_key: None,
             pipe: None,
             last_spawn_attempt: None,
@@ -107,11 +128,44 @@ impl TextServiceState {
 
     fn ensure_candidate_window(&mut self) -> Option<&mut CandidateWindow> {
         if self.candidate_wnd.is_none() {
-            if let Ok(wnd) = CandidateWindow::new() {
+            if let Ok(mut wnd) = CandidateWindow::new() {
+                wnd.set_config(self.config.clone());
                 self.candidate_wnd = Some(wnd);
             }
         }
         self.candidate_wnd.as_mut()
+    }
+
+    fn apply_new_config(&mut self, cfg: ImeConfig, rev: u64) {
+        let prev = self.config.clone();
+        self.session.apply_config(&cfg, Some(&prev));
+        self.config = cfg.clone();
+        if rev != 0 {
+            self.config_revision = rev;
+        }
+        if let Some(ref mut wnd) = self.candidate_wnd {
+            wnd.set_config(cfg);
+        }
+    }
+
+    fn sync_config_from_server(&mut self, force: bool) -> bool {
+        if !force {
+            if let Some(t) = self.last_config_poll {
+                if t.elapsed() < Duration::from_secs(2) {
+                    return false;
+                }
+            }
+        }
+        self.last_config_poll = Some(Instant::now());
+        if let Some(IpcResponse::Config { config, revision }) =
+            self.send_ipc(&IpcRequest::GetConfig)
+        {
+            if revision != self.config_revision || config != self.config {
+                self.apply_new_config(config, revision);
+                return true;
+            }
+        }
+        false
     }
 
     fn hide_candidate_window(&self) {
@@ -179,8 +233,10 @@ impl TextServiceState {
         }
         let mode_label = if self.session.is_english_composing() {
             "英"
-        } else {
+        } else if self.session.chinese_punct() {
             "中"
+        } else {
+            "中."
         }
         .to_owned();
         let (page_idx, total_pages, slice, selected_in_page) = self.session.current_page();
@@ -245,8 +301,11 @@ impl TextService {
         let _ = session_id;
 
         if let Some(tm) = tm_opt {
+            let g = active_guids();
             if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
                 unsafe {
+                    let _ = km.UnpreserveKey(&g.preserved_key_shift, &PRESERVED_KEY_SHIFT);
+                    let _ = km.UnpreserveKey(&g.preserved_key_punct, &PRESERVED_KEY_PUNCT);
                     let _ = km.UnadviseKeyEventSink(tid);
                 }
             }
@@ -274,19 +333,27 @@ impl TextService {
     }
 
     fn sync_mode_compartment(&self) {
-        let (tm_opt, tid, mode) = {
+        let (tm_opt, tid, mode, chinese_punct) = {
             let mut st = self.inner.borrow_mut();
             if st.syncing_compartment {
                 return;
             }
             st.syncing_compartment = true;
-            (st.thread_mgr.clone(), st.tid, st.session.mode())
+            (
+                st.thread_mgr.clone(),
+                st.tid,
+                st.session.mode(),
+                st.session.chinese_punct(),
+            )
         };
         if let Some(tm) = tm_opt {
             set_compartment_i32(&tm, tid, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1);
-            let conv_val = match mode {
-                InputMode::Chinese => TF_CONVERSIONMODE_NATIVE as i32,
-                InputMode::English => 0,
+            let conv_val = match (mode, chinese_punct) {
+                (InputMode::Chinese, true) => {
+                    (TF_CONVERSIONMODE_NATIVE | TF_CONVERSIONMODE_SYMBOL) as i32
+                }
+                (InputMode::Chinese, false) => TF_CONVERSIONMODE_NATIVE as i32,
+                (InputMode::English, _) => 0,
             };
             set_compartment_i32(
                 &tm,
@@ -298,15 +365,45 @@ impl TextService {
         self.inner.borrow_mut().syncing_compartment = false;
     }
 
-    fn show_mode_toast_now(&self) {
+    fn show_toast_label(&self, pic: Option<&ITfContext>, label: &str) {
+        self.inner.borrow_mut().sync_config_from_server(false);
+        if !self.inner.borrow().config.show_mode_toast {
+            return;
+        }
+        if self.inner.borrow().last_caret_rect.is_none() {
+            if let Some(ctx) = pic {
+                let (_, caret) = self.read_context_and_caret(ctx);
+                if let Some(rc) = caret {
+                    self.inner.borrow_mut().last_caret_rect = Some(rc);
+                }
+            }
+        }
         let mut st = self.inner.borrow_mut();
-        let label = match st.session.mode() {
-            InputMode::Chinese => "中",
-            InputMode::English => "英",
-        };
         let caret = st.last_caret_rect;
         if let Some(wnd) = st.ensure_candidate_window() {
             wnd.show_mode_toast(label, caret);
+        }
+    }
+
+    fn show_mode_toast_now(&self, pic: Option<&ITfContext>) {
+        let label = match self.inner.borrow().session.mode() {
+            InputMode::Chinese => "中",
+            InputMode::English => "英",
+        };
+        self.show_toast_label(pic, label);
+    }
+
+    fn toggle_punctuation_mode(&self, pic: Option<&ITfContext>) {
+        let (chinese_punct, is_composing) = {
+            let mut st = self.inner.borrow_mut();
+            let punct = st.session.toggle_chinese_punct();
+            (punct, st.session.is_composing())
+        };
+        self.sync_mode_compartment();
+        if is_composing {
+            self.inner.borrow_mut().render_candidates();
+        } else {
+            self.show_toast_label(pic, if chinese_punct { "，。" } else { ",." });
         }
     }
 
@@ -360,7 +457,7 @@ impl TextService_Impl {
             if let Ok(cat_mgr) =
                 unsafe { CoCreateInstance::<_, ITfCategoryMgr>(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER) }
             {
-                if let Ok(atom) = unsafe { cat_mgr.RegisterGUID(&GUID_DISPLAY_ATTR_INPUT) } {
+                if let Ok(atom) = unsafe { cat_mgr.RegisterGUID(&active_guids().display_attr_input) } {
                     st.display_attr_atom = atom;
                 }
             }
@@ -369,6 +466,26 @@ impl TextService_Impl {
         let key_sink: ITfKeyEventSink = self.to_interface();
         let keystroke_mgr: ITfKeystrokeMgr = tm.cast()?;
         unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &key_sink, true)? };
+
+        let g = active_guids();
+        let shift_desc: Vec<u16> = "Toggle Chinese/English".encode_utf16().collect();
+        let punct_desc: Vec<u16> = "Toggle Chinese/English Punctuation".encode_utf16().collect();
+        let _ = unsafe {
+            keystroke_mgr.PreserveKey(
+                tid,
+                &g.preserved_key_shift,
+                &PRESERVED_KEY_SHIFT,
+                &shift_desc,
+            )
+        };
+        let _ = unsafe {
+            keystroke_mgr.PreserveKey(
+                tid,
+                &g.preserved_key_punct,
+                &PRESERVED_KEY_PUNCT,
+                &punct_desc,
+            )
+        };
 
         let tm_sink: ITfThreadMgrEventSink = self.to_interface();
         let source: ITfSource = tm.cast()?;
@@ -479,8 +596,17 @@ impl TextService_Impl {
                         keys: preedit,
                         limit: 50,
                     });
-                    if let Some(IpcResponse::Candidates { candidates, .. }) = resp {
-                        self.inner.borrow_mut().session.set_candidates(candidates);
+                    if let Some(IpcResponse::Candidates {
+                        candidates,
+                        config_revision,
+                        ..
+                    }) = resp
+                    {
+                        let mut st = self.inner.borrow_mut();
+                        st.session.set_candidates(candidates);
+                        if config_revision != 0 && config_revision != st.config_revision {
+                            st.sync_config_from_server(true);
+                        }
                     }
                 }
                 self.inner.borrow_mut().render_candidates();
@@ -494,13 +620,26 @@ impl TextService_Impl {
                 let sid = st.session_id;
                 let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
                 drop(st);
-                self.show_mode_toast_now();
+                self.show_mode_toast_now(pic);
             }
             KeyAction::ConsumedNoChange => {
-                self.show_mode_toast_now();
+                self.show_mode_toast_now(pic);
             }
             _ => {}
         }
+    }
+
+    fn handle_shift_release_event(&self, pic: Option<&ITfContext>, wparam: usize) -> bool {
+        let (ev, mods) = map_win_key(wparam, true);
+        if matches!(ev, KeyEvent::ShiftUp) {
+            let pending = self.inner.borrow().session.shift_pending_tap();
+            if pending {
+                let action = self.inner.borrow_mut().session.handle_key(ev, mods);
+                self.apply_shift_toggle_action(pic, action);
+                return true;
+            }
+        }
+        false
     }
 
     fn execute_action(&self, context: &ITfContext, action: KeyAction) {
@@ -532,9 +671,28 @@ impl TextService_Impl {
                             limit: 50,
                         })
                     };
-                    if let Some(IpcResponse::Candidates { candidates, .. }) = resp {
-                        self.inner.borrow_mut().session.set_candidates(candidates);
+                    if let Some(IpcResponse::Candidates {
+                        candidates,
+                        config_revision,
+                        ..
+                    }) = resp
+                    {
+                        let mut st = self.inner.borrow_mut();
+                        st.session.set_candidates(candidates);
+                        if config_revision != 0 && config_revision != st.config_revision {
+                            st.sync_config_from_server(true);
+                        }
                     }
+                } else {
+                    if self.inner.borrow().last_caret_rect.is_none() {
+                        let (ctx_text, caret) = self.read_context_and_caret(context);
+                        let mut st = self.inner.borrow_mut();
+                        st.last_context_text = ctx_text;
+                        if let Some(rc) = caret {
+                            st.last_caret_rect = Some(rc);
+                        }
+                    }
+                    self.inner.borrow_mut().sync_config_from_server(false);
                 }
                 self.inner.borrow_mut().render_candidates();
             }
@@ -603,10 +761,19 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         &self,
         pic: Ref<ITfContext>,
         wparam: windows::Win32::Foundation::WPARAM,
-        _lparam: windows::Win32::Foundation::LPARAM,
+        lparam: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
         let vk = (wparam.0 & 0xFF) as u16;
+        let is_repeat = ((lparam.0 as u32) & 0x4000_0000) != 0;
         let (ev, mods) = map_win_key(wparam.0, false);
+
+        if vk == VK_OEM_PERIOD.0 && mods.ctrl && !mods.alt && !mods.shift && !mods.win {
+            let mut st = self.inner.borrow_mut();
+            st.last_test_key = Some((wparam.0, ev, mods));
+            st.session.note_test_key_with_repeat(ev, mods, is_repeat);
+            return Ok(BOOL(1));
+        }
+
         let dropped_action = self
             .inner
             .borrow_mut()
@@ -624,7 +791,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             } else {
                 None
             };
-            st.session.note_test_key(ev, mods);
+            st.session.note_test_key_with_repeat(ev, mods, is_repeat);
             let fallback_commit = if !eaten
                 && !mods.ctrl
                 && !mods.alt
@@ -663,14 +830,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: windows::Win32::Foundation::WPARAM,
         _lparam: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
-        let (ev, mods) = map_win_key(wparam.0, true);
-        if matches!(ev, KeyEvent::ShiftUp) {
-            let pending = self.inner.borrow().session.shift_pending_tap();
-            if pending {
-                let action = self.inner.borrow_mut().session.handle_key(ev, mods);
-                self.apply_shift_toggle_action(pic.as_ref(), action);
-            }
-        }
+        let _ = self.handle_shift_release_event(pic.as_ref(), wparam.0);
         Ok(BOOL(0))
     }
 
@@ -681,6 +841,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         _lparam: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
         let context = pic.ok()?;
+        let vk = (wparam.0 & 0xFF) as u16;
         let (ev, mods) = {
             let mut st = self.inner.borrow_mut();
             match st.last_test_key.take() {
@@ -688,6 +849,10 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 _ => map_win_key(wparam.0, false),
             }
         };
+        if vk == VK_OEM_PERIOD.0 && mods.ctrl && !mods.alt && !mods.shift && !mods.win {
+            self.toggle_punctuation_mode(Some(context));
+            return Ok(BOOL(1));
+        }
         let action = self.inner.borrow_mut().session.handle_key(ev, mods);
         let eaten = !matches!(action, KeyAction::PassThrough | KeyAction::PassThroughAndUndo);
         self.execute_action(context, action);
@@ -696,15 +861,50 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
     fn OnKeyUp(
         &self,
-        _pic: Ref<ITfContext>,
-        _wparam: windows::Win32::Foundation::WPARAM,
+        pic: Ref<ITfContext>,
+        wparam: windows::Win32::Foundation::WPARAM,
         _lparam: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
+        let _ = self.handle_shift_release_event(pic.as_ref(), wparam.0);
         Ok(BOOL(0))
     }
 
-    fn OnPreservedKey(&self, _pic: Ref<ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
-        Ok(BOOL(0))
+    fn OnPreservedKey(&self, pic: Ref<ITfContext>, rguid: *const GUID) -> Result<BOOL> {
+        if rguid.is_null() {
+            return Ok(BOOL(0));
+        }
+        let guid = unsafe { *rguid };
+        let g = active_guids();
+        if guid == g.preserved_key_shift {
+            if key_down(VK_CONTROL.0)
+                || key_down(VK_MENU.0)
+                || key_down(VK_LWIN.0)
+                || key_down(VK_RWIN.0)
+                || key_down(VK_LBUTTON.0)
+                || key_down(VK_RBUTTON.0)
+            {
+                self.inner.borrow_mut().session.note_test_key(
+                    KeyEvent::Other,
+                    KeyModifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                );
+                return Ok(BOOL(0));
+            }
+            let action = self.inner.borrow_mut().session.take_preserved_shift_tap();
+            if let Some(act) = action {
+                self.apply_shift_toggle_action(pic.as_ref(), act);
+                Ok(BOOL(1))
+            } else {
+                Ok(BOOL(0))
+            }
+        } else if guid == g.preserved_key_punct {
+            self.toggle_punctuation_mode(pic.as_ref());
+            Ok(BOOL(1))
+        } else {
+            Ok(BOOL(0))
+        }
     }
 }
 
@@ -735,6 +935,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         st.hide_candidate_window();
         let sid = st.session_id;
         let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
+        st.sync_config_from_server(false);
         Ok(())
     }
 
@@ -770,7 +971,7 @@ impl ITfDisplayAttributeProvider_Impl for TextService_Impl {
         if guid.is_null() {
             return Err(Error::from(E_POINTER));
         }
-        if unsafe { *guid } == GUID_DISPLAY_ATTR_INPUT {
+        if unsafe { *guid } == active_guids().display_attr_input {
             Ok(InputDisplayAttributeInfo.into())
         } else {
             Err(Error::from(E_INVALIDARG))
@@ -797,7 +998,13 @@ impl ITfCompartmentEventSink_Impl for TextService_Impl {
                     } else {
                         InputMode::English
                     };
-                    self.inner.borrow_mut().session.set_mode(new_mode);
+                    let mut st = self.inner.borrow_mut();
+                    let old_mode = st.session.mode();
+                    if old_mode == InputMode::Chinese && new_mode == InputMode::Chinese {
+                        st.session
+                            .set_chinese_punct((val & (TF_CONVERSIONMODE_SYMBOL as i32)) != 0);
+                    }
+                    st.session.set_mode(new_mode);
                 }
             }
         }
@@ -857,10 +1064,17 @@ fn caps_toggled() -> bool {
 fn map_win_key(wparam: usize, is_up: bool) -> (KeyEvent, KeyModifiers) {
     let vk = (wparam & 0xFF) as u16;
     let mods = KeyModifiers {
-        ctrl: key_down(VK_CONTROL.0),
-        alt: key_down(VK_MENU.0),
-        shift: key_down(VK_SHIFT.0) || key_down(VK_LSHIFT.0) || key_down(VK_RSHIFT.0),
-        win: key_down(VK_LWIN.0) || key_down(VK_RWIN.0),
+        ctrl: key_down(VK_CONTROL.0)
+            || (!is_up && (vk == VK_CONTROL.0 || vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0)),
+        alt: key_down(VK_MENU.0)
+            || (!is_up && (vk == VK_MENU.0 || vk == VK_LMENU.0 || vk == VK_RMENU.0)),
+        shift: key_down(VK_SHIFT.0)
+            || key_down(VK_LSHIFT.0)
+            || key_down(VK_RSHIFT.0)
+            || (!is_up && (vk == VK_SHIFT.0 || vk == VK_LSHIFT.0 || vk == VK_RSHIFT.0)),
+        win: key_down(VK_LWIN.0)
+            || key_down(VK_RWIN.0)
+            || (!is_up && (vk == VK_LWIN.0 || vk == VK_RWIN.0)),
     };
     let ev = if vk == VK_SHIFT.0 || vk == VK_LSHIFT.0 || vk == VK_RSHIFT.0 {
         if is_up {
@@ -900,7 +1114,7 @@ fn map_win_key(wparam: usize, is_up: bool) -> (KeyEvent, KeyModifiers) {
                 KeyEvent::Other
             }
         } else if !mods.ctrl && !mods.alt && !mods.win {
-            KeyEvent::UpperChar(if mods.shift {
+            KeyEvent::RawChar(if mods.shift {
                 (vk as u8 + 32) as char
             } else {
                 vk as u8 as char
@@ -972,4 +1186,70 @@ fn map_win_key(wparam: usize, is_up: bool) -> (KeyEvent, KeyModifiers) {
         KeyEvent::Other
     };
     (ev, mods)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::globals::dll_ref_count;
+    use windows::Win32::UI::TextServices::{ITfKeyEventSink, ITfTextInputProcessorEx};
+
+    #[test]
+    fn preserved_keys_toggle_and_dedup_callbacks() {
+        let tip: ITfTextInputProcessorEx = TextService::new().into();
+        let imp: &TextService = unsafe { windows_core::AsImpl::as_impl(&tip) };
+        let key_sink: ITfKeyEventSink = tip.cast().expect("cast ITfKeyEventSink");
+
+        let wp_shift = windows::Win32::Foundation::WPARAM(VK_SHIFT.0 as usize);
+        let lp0 = windows::Win32::Foundation::LPARAM(0);
+
+        let g = active_guids();
+        unsafe {
+            // 1. OnPreservedKey(VK_SHIFT) toggles Chinese -> English even without prior ShiftDown.
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::Chinese);
+            assert!(key_sink.OnPreservedKey(None, &g.preserved_key_shift).unwrap().as_bool());
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::English);
+
+            // Immediate duplicate OnTestKeyUp / OnKeyUp must NOT double-toggle.
+            let _ = key_sink.OnTestKeyUp(None, wp_shift, lp0);
+            let _ = key_sink.OnKeyUp(None, wp_shift, lp0);
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::English);
+
+            // Second OnPreservedKey toggles English -> Chinese.
+            assert!(key_sink.OnPreservedKey(None, &g.preserved_key_shift).unwrap().as_bool());
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::Chinese);
+
+            // 2. Shift combo (ShiftDown + Shift+'N') rejects preserved Shift release.
+            let _ = key_sink.OnTestKeyDown(None, wp_shift, lp0);
+            imp.inner.borrow_mut().session.note_test_key_with_repeat(
+                KeyEvent::UpperChar('N'),
+                KeyModifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                false,
+            );
+            assert!(!key_sink.OnPreservedKey(None, &g.preserved_key_shift).unwrap().as_bool());
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::Chinese);
+
+            // 3. OnPreservedKey(Ctrl+.) toggles Chinese <-> English punctuation cleanly.
+            assert!(imp.inner.borrow().session.chinese_punct());
+            assert!(key_sink.OnPreservedKey(None, &g.preserved_key_punct).unwrap().as_bool());
+            assert!(!imp.inner.borrow().session.chinese_punct());
+            assert!(key_sink.OnPreservedKey(None, &g.preserved_key_punct).unwrap().as_bool());
+            assert!(imp.inner.borrow().session.chinese_punct());
+
+            // 4. Fallback: OnTestKeyDown(VK_SHIFT) -> OnKeyUp(VK_SHIFT) without OnPreservedKey/OnTestKeyUp.
+            let _ = key_sink.OnTestKeyDown(None, wp_shift, lp0);
+            let _ = key_sink.OnKeyUp(None, wp_shift, lp0);
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::English);
+            // Repeat OnKeyUp must not double-toggle.
+            let _ = key_sink.OnKeyUp(None, wp_shift, lp0);
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::English);
+        }
+        drop(key_sink);
+        drop(tip);
+        // Release the process-global DLL ref check cleanly only up to live objects.
+        let _ = dll_ref_count();
+    }
 }

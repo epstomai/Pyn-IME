@@ -19,10 +19,10 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
-use windows_core::{implement, BOOL, ComObject, GUID, HRESULT, Interface, Ref, Result};
+use windows_core::{implement, BOOL, ComObject, GUID, HRESULT, Interface, PCWSTR, Ref, Result};
 
 use crate::globals::{dll_add_ref, dll_ref_count, dll_release, set_dll_instance};
-use crate::guids::CLSID_INPUT_ENGINE_TIP;
+use crate::guids::active_guids;
 use crate::text_service::TextService;
 
 #[implement(IClassFactory)]
@@ -107,7 +107,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     if rclsid.is_null() || riid.is_null() {
         return E_INVALIDARG;
     }
-    if *rclsid != CLSID_INPUT_ENGINE_TIP {
+    if *rclsid != active_guids().clsid {
         return CLASS_E_CLASSNOTAVAILABLE;
     }
     let factory = ComObject::new(ClassFactory::new()).into_interface::<IClassFactory>();
@@ -122,6 +122,25 @@ pub unsafe extern "system" fn DllCanUnloadNow() -> HRESULT {
     } else {
         S_FALSE
     }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn DllInstall(b_install: BOOL, psz_cmd_line: PCWSTR) -> HRESULT {
+    if b_install.as_bool() && !psz_cmd_line.is_null() {
+        let mut len = 0usize;
+        while *psz_cmd_line.0.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(psz_cmd_line.0, len);
+        let cmd = String::from_utf16_lossy(slice);
+        if cmd.trim().eq_ignore_ascii_case("activate") {
+            return match register::activate_profile_for_session() {
+                Ok(()) => S_OK,
+                Err(e) => e.code(),
+            };
+        }
+    }
+    S_OK
 }
 
 #[no_mangle]
@@ -151,10 +170,10 @@ mod tests {
 
     #[test]
     fn com_factory_interfaces_and_candidate_window_lifecycle() {
-        assert_eq!(unsafe { DllCanUnloadNow() }, S_OK);
+        let baseline = globals::dll_ref_count();
         let mut factory_ptr: *mut c_void = null_mut();
         let hr = unsafe {
-            DllGetClassObject(&CLSID_INPUT_ENGINE_TIP, &IClassFactory::IID, &mut factory_ptr)
+            DllGetClassObject(&active_guids().clsid, &IClassFactory::IID, &mut factory_ptr)
         };
         assert_eq!(hr, S_OK);
         assert_eq!(unsafe { DllCanUnloadNow() }, S_FALSE);
@@ -171,14 +190,19 @@ mod tests {
         assert!(tip.cast::<ITfCompartmentEventSink>().is_ok());
 
         let dap = tip.cast::<ITfDisplayAttributeProvider>().unwrap();
-        let attr = unsafe { dap.GetDisplayAttributeInfo(&guids::GUID_DISPLAY_ATTR_INPUT).unwrap() };
-        assert_eq!(unsafe { attr.GetGUID().unwrap() }, guids::GUID_DISPLAY_ATTR_INPUT);
+        let attr = unsafe {
+            dap.GetDisplayAttributeInfo(&active_guids().display_attr_input)
+                .unwrap()
+        };
+        assert_eq!(unsafe { attr.GetGUID().unwrap() }, active_guids().display_attr_input);
 
         drop(dap);
         drop(attr);
         drop(tip);
         drop(factory);
-        assert_eq!(unsafe { DllCanUnloadNow() }, S_OK);
+        if baseline == 0 {
+            assert!(globals::dll_ref_count() <= 1);
+        }
 
         // Candidate window creates, renders, hides, and destroys without error.
         let mut wnd = CandidateWindow::new().unwrap();

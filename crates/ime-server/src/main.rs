@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use ime_core::decoder::decode_with_user;
 use ime_core::user_dict::LearnDelta;
 use ime_core::{DecoderConfig, LearnConfig, Model, Reranker, UserMemory};
+use ime_ipc::config::ImeConfig;
 use ime_ipc::pipe::{to_wide_null, NamedPipeClient, NamedPipeServerInstance};
 use ime_ipc::protocol::{read_frame, write_frame, IpcRequest, IpcResponse, DEFAULT_PIPE_NAME};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
@@ -162,6 +163,8 @@ struct ClientSessionState {
 
 struct ServerState {
     user: UserMemory,
+    config: ImeConfig,
+    config_revision: u64,
     sessions: HashMap<u64, ClientSessionState>,
     dirty: bool,
     last_save: Instant,
@@ -194,6 +197,8 @@ struct ServerCtx {
     reranker: Option<Arc<Reranker>>,
     decoder_cfg: DecoderConfig,
     user_dict_path: PathBuf,
+    config_path: PathBuf,
+    force_no_learn: bool,
     pipe_name: String,
     shutdown: AtomicBool,
     state: Mutex<ServerState>,
@@ -289,6 +294,7 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
             IpcResponse::Candidates {
                 candidates: outcome.candidates,
                 latency_ms,
+                config_revision: st.config_revision,
             }
         }
         IpcRequest::Commit {
@@ -382,6 +388,45 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                 sess.last_delta = None;
             }
             IpcResponse::Ack { ok: true }
+        }
+        IpcRequest::GetConfig => {
+            let st = match ctx.state.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    return IpcResponse::Error {
+                        message: "server state mutex poisoned".into(),
+                    }
+                }
+            };
+            IpcResponse::Config {
+                config: st.config.clone(),
+                revision: st.config_revision,
+            }
+        }
+        IpcRequest::SetConfig { config } => {
+            let norm = config.normalized();
+            if let Err(err) = norm.save_atomic(&ctx.config_path) {
+                return IpcResponse::Error {
+                    message: format!("save config failed: {err}"),
+                };
+            }
+            let mut st = match ctx.state.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    return IpcResponse::Error {
+                        message: "server state mutex poisoned".into(),
+                    }
+                }
+            };
+            st.config = norm.clone();
+            st.config_revision = st.config_revision.saturating_add(1);
+            if !ctx.force_no_learn {
+                st.user.set_enabled(norm.learning_enabled);
+            }
+            IpcResponse::Config {
+                config: norm,
+                revision: st.config_revision,
+            }
         }
         IpcRequest::Stats => {
             let st = match ctx.state.lock() {
@@ -521,10 +566,14 @@ fn main() {
     };
 
     let user_dict_path = resolve_user_dict_path(cli.user_dict_path);
+    let config_path = ImeConfig::default_config_path();
+    let config = ImeConfig::load_from(&config_path);
     let mut learn_cfg = LearnConfig::default();
-    if cli.no_learn {
-        learn_cfg.enabled = false;
-    }
+    learn_cfg.enabled = if cli.no_learn {
+        false
+    } else {
+        config.learning_enabled
+    };
     let user = if user_dict_path.exists() {
         match UserMemory::load(&user_dict_path, &model, learn_cfg) {
             Ok(u) => u,
@@ -545,10 +594,14 @@ fn main() {
         reranker,
         decoder_cfg: DecoderConfig::default(),
         user_dict_path,
+        config_path,
+        force_no_learn: cli.no_learn,
         pipe_name: cli.pipe_name.clone(),
         shutdown: AtomicBool::new(false),
         state: Mutex::new(ServerState {
             user,
+            config,
+            config_revision: 1,
             sessions: HashMap::new(),
             dirty: false,
             last_save: Instant::now(),

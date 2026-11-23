@@ -160,6 +160,12 @@ pub fn suggest_english_candidates(raw_keys: &str, max_results: usize) -> Vec<Str
     {
         return out;
     }
+    let bytes = raw_keys.as_bytes();
+    let has_internal_upper = bytes[1..].iter().any(|b| b.is_ascii_uppercase());
+    let has_lower = bytes.iter().any(|b| b.is_ascii_lowercase());
+    if has_internal_upper && has_lower {
+        return out;
+    }
 
     let lower = raw_keys.to_ascii_lowercase();
     let start = ENGLISH_WORDS.partition_point(|&w| w < lower.as_str());
@@ -232,6 +238,7 @@ mod tests {
         assert!(upper.iter().any(|w| w.starts_with("HT") && w.len() > 2));
 
         assert_eq!(suggest_english_candidates("NiloToon", 5), vec!["NiloToon"]);
+        assert_eq!(suggest_english_candidates("InP", 5), vec!["InP"]);
         assert_eq!(suggest_english_candidates("a", 5), vec!["a"]);
         assert!(suggest_english_candidates("", 5).is_empty());
     }

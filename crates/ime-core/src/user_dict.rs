@@ -40,6 +40,28 @@ pub(crate) fn is_protected_function_char(ch: char) -> bool {
     PROTECTED_FUNCTION_WORDS.contains(&s)
 }
 
+/// True only when `(ch, syl)` is an actual protected function-word reading (e.g. `地/de`,
+/// `了/le`, `着/zhe`), avoiding false positives on content-word homographs like `地/di`
+/// (`质地`/`时之笛`), `了/liao` (`了解`), or `着/zhao` (`着火`).
+#[inline]
+fn is_protected_function_reading(ch: char, syl: SyllableId) -> bool {
+    match (ch, syllable_str(syl)) {
+        ('的' | '得' | '地', "de")
+        | ('了', "le")
+        | ('着', "zhe")
+        | ('过', "guo")
+        | ('吗' | '嘛', "ma")
+        | ('呢', "ne")
+        | ('吧', "ba")
+        | ('啊', "a")
+        | ('呀', "ya")
+        | ('啦', "la")
+        | ('哦', "o")
+        | ('么', "me") => true,
+        _ => false,
+    }
+}
+
 #[inline]
 fn is_protected_function_syllable(syl: SyllableId) -> bool {
     PROTECTED_FUNCTION_SYLLABLES.contains(&syllable_str(syl))
@@ -70,18 +92,18 @@ impl Default for LearnConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_confirm_count: 1.95,
-            min_bigram_confirm: 1.95,
-            vocab_base_boost: 2.5,
-            vocab_log_slope: 0.7,
-            max_vocab_boost: 3.8,
-            oov_base_boost: 3.0,
-            oov_log_slope: 0.8,
-            max_oov_boost: 5.0,
-            bigram_base_boost: 1.0,
-            bigram_log_slope: 0.5,
-            max_bigram_boost: 2.0,
-            decay_half_life: 2000.0,
+            min_confirm_count: 1.5,
+            min_bigram_confirm: 1.5,
+            vocab_base_boost: 4.5,
+            vocab_log_slope: 1.0,
+            max_vocab_boost: 7.0,
+            oov_base_boost: 5.0,
+            oov_log_slope: 1.0,
+            max_oov_boost: 7.5,
+            bigram_base_boost: 1.2,
+            bigram_log_slope: 0.6,
+            max_bigram_boost: 2.5,
+            decay_half_life: 8000.0,
             undo_demote_step: 1.5,
             undo_strike_penalty: 1.0,
             max_words: 8192,
@@ -264,6 +286,36 @@ impl UserMemory {
         out
     }
 
+    /// Returns staged (once-seen, zero-strike) OOV words for an exact full-input key so
+    /// the decoder can surface them as non-top-1 (#2) candidates for one-key confirmation.
+    pub fn staged_oov_for_key(&self, packed_key: u64) -> Vec<String> {
+        if !self.config.enabled || self.words.is_empty() {
+            return Vec::new();
+        }
+        let Some(word_list) = self.by_key.get(&packed_key) else {
+            return Vec::new();
+        };
+        let mut staged: Vec<(f32, u64, String)> = Vec::new();
+        for w in word_list {
+            if let Some(entry) = self.words.get(&(packed_key, w.clone())) {
+                if !entry.is_oov || entry.undo_strikes > 0 {
+                    continue;
+                }
+                let eff = self.decayed_count(entry.count, entry.last_step);
+                let thresh = self.effective_threshold(entry);
+                if eff >= 0.75 && eff < thresh {
+                    staged.push((eff, entry.last_step, entry.word.clone()));
+                }
+            }
+        }
+        staged.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        staged.into_iter().map(|(_, _, w)| w).collect()
+    }
+
     pub fn active_bigram_boost(&self, prev_h2: u32, word: &str) -> f32 {
         if !self.config.enabled
             || self.bigrams.is_empty()
@@ -363,10 +415,15 @@ impl UserMemory {
         };
 
         // G5: track short 1..=2 char exact-pinyin commits for cross-commit OOV assembly.
+        // Treat stop characters and protected function-word readings as flush boundaries so
+        // adjacent words like `我`/`在`/`的`/`了` flush the preceding OOV phrase cleanly instead
+        // of merging into it and causing rejection.
         let text_chars: Vec<char> = text.chars().collect();
         let is_compose_piece = (1..=2).contains(&text_chars.len())
             && text_chars.iter().all(|&c| is_hanzi(c))
+            && !text_chars.iter().any(|&c| COMPOSE_STOP_CHARS.contains(&c))
             && !keys.is_empty()
+            && !is_piece_protected_function(model, keys, &text_chars)
             && build_dag(keys).exact_only;
 
         if is_compose_piece {
@@ -404,17 +461,23 @@ impl UserMemory {
             return delta;
         };
 
-        // G3a: never override or substitute a protected function-word slot relative to base top-1.
+        // G3a: never override or substitute a protected function-word slot relative to base top-1,
+        // checking the aligned syllable so content-word homographs like `地/di` do not false-trigger.
         if let Some(base) = base_top1 {
-            if has_protected_function_mismatch(base, &text_chars) {
+            if has_protected_function_mismatch(base, &text_chars, &syls) {
                 return delta;
             }
         }
 
-        // G3b: OOV phrases containing protected function words are rejected unconditionally.
+        // G3b: OOV phrases containing a protected function-word reading are rejected unconditionally.
         let model_word_id = model.word_id(text);
         let is_oov = model_word_id.is_none();
-        if is_oov && text_chars.iter().any(|&c| is_protected_function_char(c)) {
+        if is_oov
+            && text_chars
+                .iter()
+                .zip(syls.iter())
+                .any(|(&c, &s)| is_protected_function_reading(c, s))
+        {
             return delta;
         }
 
@@ -649,7 +712,12 @@ impl UserMemory {
                     };
                     let model_word_id = model.word_id(word);
                     let is_oov = model_word_id.is_none();
-                    if is_oov && chars.iter().any(|&c| is_protected_function_char(c)) {
+                    if is_oov
+                        && chars
+                            .iter()
+                            .zip(syls.iter())
+                            .any(|(&c, &s)| is_protected_function_reading(c, s))
+                    {
                         continue;
                     }
                     let key = (packed_key, word.to_owned());
@@ -714,13 +782,17 @@ impl UserMemory {
         if model.word_id(&joined_text).is_some() {
             return None;
         }
-        if chars
-            .iter()
-            .any(|&c| is_protected_function_char(c) || COMPOSE_STOP_CHARS.contains(&c))
-        {
+        if chars.iter().any(|&c| COMPOSE_STOP_CHARS.contains(&c)) {
             return None;
         }
         let syls = align_exact_syllables(model, &joined_keys, &joined_text)?;
+        if chars
+            .iter()
+            .zip(syls.iter())
+            .any(|(&c, &s)| is_protected_function_reading(c, s))
+        {
+            return None;
+        }
         if is_protected_function_syllable(*syls.last()?) {
             return None;
         }
@@ -926,14 +998,44 @@ pub(crate) fn decayed_count(count: f32, last_step: u64, now_step: u64, half_life
     count * 0.5_f32.powf(dt / half_life.max(1.0))
 }
 
-fn has_protected_function_mismatch(base_top1: &str, text_chars: &[char]) -> bool {
-    let base_chars: Vec<char> = base_top1.chars().collect();
-    if base_chars.len() != text_chars.len() {
+fn is_piece_protected_function(model: &Model, keys: &str, text_chars: &[char]) -> bool {
+    if !text_chars.iter().any(|&c| is_protected_function_char(c)) {
         return false;
     }
-    base_chars.iter().zip(text_chars.iter()).any(|(&bc, &tc)| {
-        bc != tc && (is_protected_function_char(bc) || is_protected_function_char(tc))
-    })
+    if text_chars.len() == 1 {
+        if let Some(syl) = syllable_id(keys) {
+            return is_protected_function_reading(text_chars[0], syl);
+        }
+        return false;
+    }
+    let text: String = text_chars.iter().collect();
+    if let Some(syls) = align_exact_syllables(model, keys, &text) {
+        return text_chars
+            .iter()
+            .zip(syls.iter())
+            .any(|(&c, &s)| is_protected_function_reading(c, s));
+    }
+    false
+}
+
+fn has_protected_function_mismatch(
+    base_top1: &str,
+    text_chars: &[char],
+    syls: &[SyllableId],
+) -> bool {
+    let base_chars: Vec<char> = base_top1.chars().collect();
+    if base_chars.len() != text_chars.len() || syls.len() != text_chars.len() {
+        return false;
+    }
+    base_chars
+        .iter()
+        .zip(text_chars.iter())
+        .zip(syls.iter())
+        .any(|((&bc, &tc), &syl)| {
+            bc != tc
+                && (is_protected_function_reading(bc, syl)
+                    || is_protected_function_reading(tc, syl))
+        })
 }
 
 /// Finds the highest-probability exact syllable sequence spelling `text` along `keys`.
@@ -1174,11 +1276,112 @@ mod tests {
         for _ in 0..4 {
             mem.record_commit(&model, "quanli", "权利", "", Some("权力"), Some("权力"));
         }
-        assert!(!mem.active_entries_for_key(quanli_key).is_empty());
+        let before_heal = mem.active_entries_for_key(quanli_key)[0].boost;
         let d_heal = mem.record_commit(&model, "quanli", "权力", "", Some("权力"), Some("权利"));
         let after_heal = mem.active_entries_for_key(quanli_key);
-        assert!(after_heal.is_empty() || after_heal[0].boost < 3.0);
+        assert!(after_heal.is_empty() || after_heal[0].boost < before_heal);
         mem.undo_commit(d_heal);
+    }
+
+    #[test]
+    fn content_homograph_di_not_blocked_and_compose_flushes_at_function_words() {
+        let mut words = vec![
+            "<bos>", "<eos>", "<pause>", "的", "地", "我", "林", "子", "轩", "时", "之", "笛",
+            "是", "质",
+        ];
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        let mut word_bytes = Vec::new();
+        for w in &words {
+            word_offsets.push(word_bytes.len() as u32);
+            word_bytes.extend_from_slice(w.as_bytes());
+        }
+        word_offsets.push(word_bytes.len() as u32);
+        let n = words.len();
+        let mut unigram_logp = vec![-6.0_f32; n];
+        unigram_logp[EOS_ID as usize] = -2.0;
+        unigram_logp[PAUSE_ID as usize] = -2.5;
+        let unigram_bow = vec![-0.5_f32; n];
+        let mut exact_pairs = vec![
+            (pack_exact(&[syllable_id("de").unwrap()]).unwrap(), LexEntry { word_id: 3, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("de").unwrap()]).unwrap(), LexEntry { word_id: 4, reading_logp: -0.2 }),
+            (pack_exact(&[syllable_id("di").unwrap()]).unwrap(), LexEntry { word_id: 4, reading_logp: -0.1 }),
+            (pack_exact(&[syllable_id("wo").unwrap()]).unwrap(), LexEntry { word_id: 5, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("lin").unwrap()]).unwrap(), LexEntry { word_id: 6, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("zi").unwrap()]).unwrap(), LexEntry { word_id: 7, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("xuan").unwrap()]).unwrap(), LexEntry { word_id: 8, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("shi").unwrap()]).unwrap(), LexEntry { word_id: 9, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("zhi").unwrap()]).unwrap(), LexEntry { word_id: 10, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("di").unwrap()]).unwrap(), LexEntry { word_id: 11, reading_logp: -0.3 }),
+            (pack_exact(&[syllable_id("shi").unwrap()]).unwrap(), LexEntry { word_id: 12, reading_logp: 0.0 }),
+            (pack_exact(&[syllable_id("zhi").unwrap()]).unwrap(), LexEntry { word_id: 13, reading_logp: 0.0 }),
+        ];
+        exact_pairs.sort_by_key(|x| x.0);
+        let mut keys = Vec::new();
+        let mut ranges = vec![0u32];
+        let mut entries = Vec::new();
+        for (k, e) in exact_pairs {
+            if keys.last().copied() != Some(k) {
+                if !keys.is_empty() {
+                    ranges.push(entries.len() as u32);
+                }
+                keys.push(k);
+            }
+            entries.push(e);
+        }
+        ranges.push(entries.len() as u32);
+        let _ = &mut words;
+        let model = Model::from_parts(
+            word_offsets,
+            word_bytes,
+            unigram_logp,
+            unigram_bow,
+            LexTable { keys, ranges, entries },
+            std::array::from_fn(|_| Vec::new()),
+            LexTable::default(),
+            LexTable::default(),
+            vec![0u32; n + 1],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![0u32],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let mut mem = UserMemory::default();
+        let szd_key = pack_exact(&[
+            syllable_id("shi").unwrap(),
+            syllable_id("zhi").unwrap(),
+            syllable_id("di").unwrap(),
+        ])
+        .unwrap();
+
+        // 1. G3a must NOT reject `时之笛` when `base_top1` is `是质地` (`地` is read `di`, not `de`).
+        mem.record_commit(&model, "shizhidi", "时之笛", "", Some("是质地"), Some("是质地"));
+        assert_eq!(mem.staged_oov_for_key(szd_key), vec!["时之笛".to_owned()]);
+        mem.record_commit(&model, "shizhidi", "时之笛", "", Some("是质地"), Some("是质地"));
+        let active = mem.active_entries_for_key(szd_key);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].word, "时之笛");
+        assert!(active[0].boost >= 5.0);
+
+        // 2. Stop/function words (`我` / `的`) flanking piece-by-piece typing flush `林子轩` cleanly.
+        let lzx_key = pack_exact(&[
+            syllable_id("lin").unwrap(),
+            syllable_id("zi").unwrap(),
+            syllable_id("xuan").unwrap(),
+        ])
+        .unwrap();
+        for _ in 0..2 {
+            mem.record_commit(&model, "wo", "我", "", Some("我"), Some("我"));
+            mem.record_commit(&model, "lin", "林", "", Some("林"), Some("林"));
+            mem.record_commit(&model, "zi", "子", "", Some("子"), Some("子"));
+            mem.record_commit(&model, "xuan", "轩", "", Some("轩"), Some("轩"));
+            mem.record_commit(&model, "de", "的", "", Some("的"), Some("的"));
+        }
+        let lzx_active = mem.active_entries_for_key(lzx_key);
+        assert_eq!(lzx_active.len(), 1);
+        assert_eq!(lzx_active[0].word, "林子轩");
     }
 
     #[test]

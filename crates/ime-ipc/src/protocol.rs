@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\PynTSF_v1";
+pub const LEGACY_PIPE_NAME: &str = r"\\.\pipe\InputEngineTSF_v1";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

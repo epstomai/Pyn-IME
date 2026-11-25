@@ -604,12 +604,14 @@ mod tests {
         // Baseline: "kuaixing" -> "快行" ("快杏" is OOV in toy model)
         assert_eq!(engine.convert("kuaixing", 5).first().map(String::as_str), Some("快行"));
 
-        // 1st commit of OOV "快杏" stays in staging (does NOT flip #1 yet).
+        // 1st commit of OOV "快杏" stays in staging (does NOT flip #1 yet, but surfaces at #2 for 1-key confirm).
         engine.commit("快杏");
         assert_eq!(engine.user_stats().staged_words, 1);
         assert_eq!(engine.user_stats().active_oov_words, 0);
         engine.set_context(Vec::new());
-        assert_eq!(engine.convert("kuaixing", 5).first().map(String::as_str), Some("快行"));
+        let staged_cands = engine.convert("kuaixing", 5);
+        assert_eq!(staged_cands.first().map(String::as_str), Some("快行"));
+        assert_eq!(staged_cands.get(1).map(String::as_str), Some("快杏"));
 
         // 2nd commit promotes OOV "快杏" to #1 standalone AND inside sentences.
         engine.commit("快杏");

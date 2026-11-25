@@ -25,7 +25,10 @@ use crate::protocol::{read_frame, write_frame, IpcRequest, IpcResponse};
 
 const SDDL_REVISION_1: u32 = 1;
 const PIPE_SDDL: &str = "D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;AU)(A;;GRGW;;;AC)S:(ML;;NW;;;LW)";
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 pub fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -172,13 +175,26 @@ impl Drop for NamedPipeClient {
 }
 
 pub fn spawn_server_detached(exe_path: &Path) -> io::Result<()> {
-    Command::new(exe_path)
+    let base_flags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    match Command::new(exe_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
-    Ok(())
+        .creation_flags(base_flags | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            Command::new(exe_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(base_flags)
+                .spawn()?;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn open_pipe_handle(wide_name: &[u16]) -> windows_core::Result<HANDLE> {

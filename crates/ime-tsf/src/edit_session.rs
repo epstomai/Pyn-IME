@@ -116,6 +116,22 @@ impl ReadContextAndCaretSession {
     }
 }
 
+fn read_preceding_context(ec: u32, base_range: &ITfRange) -> String {
+    if let Ok(pre_range) = unsafe { base_range.Clone() } {
+        if unsafe { pre_range.Collapse(ec, TF_ANCHOR_START) }.is_ok() {
+            let mut shifted = 0i32;
+            let _ = unsafe { pre_range.ShiftStart(ec, -32, &mut shifted, std::ptr::null()) };
+            let mut buf = [0u16; 64];
+            let mut read_len = 0u32;
+            if unsafe { pre_range.GetText(ec, 0, &mut buf, &mut read_len) }.is_ok() {
+                let n = (read_len as usize).min(buf.len());
+                return String::from_utf16_lossy(&buf[..n]);
+            }
+        }
+    }
+    String::new()
+}
+
 impl ITfEditSession_Impl for ReadContextAndCaretSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         let mut ctx_str = String::new();
@@ -123,18 +139,7 @@ impl ITfEditSession_Impl for ReadContextAndCaretSession_Impl {
 
         if let Ok(base_range) = get_anchor_range(&self.context, ec, self.composition.as_ref()) {
             caret_rect = get_caret_rect(&self.context, ec, &base_range);
-            if let Ok(pre_range) = unsafe { base_range.Clone() } {
-                if unsafe { pre_range.Collapse(ec, TF_ANCHOR_START) }.is_ok() {
-                    let mut shifted = 0i32;
-                    let _ = unsafe { pre_range.ShiftStart(ec, -32, &mut shifted, std::ptr::null()) };
-                    let mut buf = [0u16; 64];
-                    let mut read_len = 0u32;
-                    if unsafe { pre_range.GetText(ec, 0, &mut buf, &mut read_len) }.is_ok() {
-                        let n = (read_len as usize).min(buf.len());
-                        ctx_str = String::from_utf16_lossy(&buf[..n]);
-                    }
-                }
-            }
+            ctx_str = read_preceding_context(ec, &base_range);
         }
         *self.out.borrow_mut() = (ctx_str, caret_rect);
         Ok(())
@@ -166,6 +171,7 @@ pub struct UpdateCompositionSession {
     preedit: String,
     display_attr_atom: u32,
     caret_out: Rc<RefCell<Option<RECT>>>,
+    context_out: Rc<RefCell<Option<String>>>,
 }
 
 impl UpdateCompositionSession {
@@ -176,6 +182,7 @@ impl UpdateCompositionSession {
         preedit: String,
         display_attr_atom: u32,
         caret_out: Rc<RefCell<Option<RECT>>>,
+        context_out: Rc<RefCell<Option<String>>>,
     ) -> Self {
         Self {
             context,
@@ -184,6 +191,7 @@ impl UpdateCompositionSession {
             preedit,
             display_attr_atom,
             caret_out,
+            context_out,
         }
     }
 }
@@ -216,9 +224,11 @@ impl ITfEditSession_Impl for UpdateCompositionSession_Impl {
         apply_display_attr(&self.context, ec, &range, self.display_attr_atom);
         let _ = set_selection_to_end(&self.context, ec, &range);
         let caret = get_caret_rect(&self.context, ec, &range);
+        let ctx_str = read_preceding_context(ec, &range);
 
         *self.composition_slot.borrow_mut() = Some(comp);
         *self.caret_out.borrow_mut() = caret;
+        *self.context_out.borrow_mut() = Some(ctx_str);
         Ok(())
     }
 }

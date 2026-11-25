@@ -321,18 +321,20 @@ impl SessionController {
                 }
                 self.shift_pending_tap = false;
                 if self.is_composing() {
-                    if self.is_english_composing() {
+                    if self.mode == InputMode::Chinese {
+                        let raw = self.take_composing_reset(false);
+                        self.mode = InputMode::English;
+                        return KeyAction::Commit {
+                            text: raw,
+                            learn_keys: None,
+                            learn_text: None,
+                        };
+                    } else {
                         self.mode = InputMode::Chinese;
                         self.keys.make_ascii_lowercase();
                         self.candidates.clear();
                         self.selected = 0;
                         return KeyAction::UpdateComposition { need_convert: true };
-                    } else {
-                        self.mode = InputMode::English;
-                        self.refresh_english_candidates();
-                        return KeyAction::UpdateComposition {
-                            need_convert: false,
-                        };
                     }
                 }
                 self.mode = match self.mode {

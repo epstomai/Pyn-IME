@@ -1,7 +1,7 @@
 //! Core Windows TSF COM Text Input Processor (`ITfTextInputProcessorEx` & sinks).
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use ime_ipc::config::ImeConfig;
@@ -22,18 +22,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_CategoryMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
-    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, IEnumTfDisplayAttributeInfo, ITfCategoryMgr,
-    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition,
-    ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfDisplayAttributeInfo,
-    ITfDisplayAttributeProvider, ITfDisplayAttributeProvider_Impl, ITfDocumentMgr, ITfEditSession,
-    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfSource, ITfTextInputProcessorEx,
-    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
-    ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_CONVERSIONMODE_NATIVE,
-    TF_CONVERSIONMODE_SYMBOL, TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_INVALID_COOKIE, TF_MOD_CONTROL, TF_MOD_ON_KEYUP, TF_PRESERVEDKEY,
+    CLSID_TF_CategoryMgr, GUID_COMPARTMENT_EMPTYCONTEXT, GUID_COMPARTMENT_KEYBOARD_DISABLED,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+    IEnumTfDisplayAttributeInfo, ITfCategoryMgr, ITfCompartmentEventSink,
+    ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition, ITfCompositionSink,
+    ITfCompositionSink_Impl, ITfContext, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
+    ITfDisplayAttributeProvider_Impl, ITfDocumentMgr, ITfEditSession, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItem, ITfLangBarItemButton,
+    ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
+    ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
+    TF_CONVERSIONMODE_NATIVE, TF_CONVERSIONMODE_SYMBOL, TF_ES_ASYNCDONTCARE, TF_ES_READ,
+    TF_ES_READWRITE, TF_ES_SYNC, TF_INVALID_COOKIE, TF_MOD_CONTROL, TF_MOD_ON_KEYUP,
+    TF_PRESERVEDKEY,
 };
-use windows_core::{implement, BOOL, Error, GUID, IUnknownImpl, Interface, Ref, Result};
+use windows_core::{implement, BOOL, ComObject, Error, GUID, IUnknownImpl, Interface, Ref, Result};
 
 use crate::candidate_ui::{CandidateViewState, CandidateWindow};
 use crate::display_attr::{EnumDisplayAttributeInfo, InputDisplayAttributeInfo};
@@ -43,6 +45,7 @@ use crate::edit_session::{
 };
 use crate::globals::{dll_add_ref, dll_module_path, dll_release, next_session_id};
 use crate::guids::active_guids;
+use crate::lang_bar::LangBarModeButton;
 
 const PRESERVED_KEY_SHIFT: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
     uVKey: VK_SHIFT.0 as u32,
@@ -97,6 +100,7 @@ struct TextServiceState {
     last_context_text: String,
     candidate_wnd: Option<CandidateWindow>,
     last_caret_rect: Option<RECT>,
+    lang_bar_btn: Option<ComObject<LangBarModeButton>>,
 }
 
 impl TextServiceState {
@@ -123,6 +127,7 @@ impl TextServiceState {
             last_context_text: String::new(),
             candidate_wnd: None,
             last_caret_rect: None,
+            lang_bar_btn: None,
         }
     }
 
@@ -196,7 +201,7 @@ impl TextServiceState {
             if let Some(dir) = dll_path.parent() {
                 let server_exe = dir.join("ime-server.exe");
                 if server_exe.exists() && spawn_server_detached(&server_exe).is_ok() {
-                    for _ in 0..20 {
+                    for _ in 0..60 {
                         std::thread::sleep(Duration::from_millis(25));
                         if let Ok(client) = NamedPipeClient::connect(DEFAULT_PIPE_NAME, 50) {
                             self.pipe = Some(client);
@@ -215,14 +220,14 @@ impl TextServiceState {
                 return Some(resp);
             }
         }
-        // Reconnect once if existing pipe broke (e.g. server restarted).
+        // Reconnect (or auto-spawn) once if existing pipe broke (e.g. server restarted/exited).
         self.pipe = None;
-        if let Ok(mut client) = NamedPipeClient::connect(DEFAULT_PIPE_NAME, 50) {
+        if let Some(client) = self.ensure_pipe() {
             if let Ok(resp) = client.request(req) {
-                self.pipe = Some(client);
                 return Some(resp);
             }
         }
+        self.pipe = None;
         None
     }
 
@@ -269,19 +274,19 @@ impl TextServiceState {
     ITfCompartmentEventSink
 )]
 pub struct TextService {
-    inner: RefCell<TextServiceState>,
+    inner: Rc<RefCell<TextServiceState>>,
 }
 
 impl TextService {
     pub fn new() -> Self {
         dll_add_ref();
         Self {
-            inner: RefCell::new(TextServiceState::new()),
+            inner: Rc::new(RefCell::new(TextServiceState::new())),
         }
     }
 
     fn deactivate_internal(&self) {
-        let (tm_opt, tid, tm_cookie, comp_cookie, session_id) = {
+        let (tm_opt, tid, tm_cookie, comp_cookie, lang_bar_btn, session_id) = {
             let mut st = self.inner.borrow_mut();
             st.session.on_focus_change();
             st.last_test_key = None;
@@ -293,12 +298,25 @@ impl TextService {
                 st.tid,
                 std::mem::replace(&mut st.thread_mgr_cookie, TF_INVALID_COOKIE),
                 std::mem::replace(&mut st.conv_comp_cookie, TF_INVALID_COOKIE),
+                st.lang_bar_btn.take(),
                 st.session_id,
             );
             st.pipe = None;
             res
         };
         let _ = session_id;
+
+        if let Some(btn) = lang_bar_btn {
+            btn.detach();
+            if let Some(ref tm) = tm_opt {
+                if let Ok(lb_mgr) = tm.cast::<ITfLangBarItemMgr>() {
+                    let item: ITfLangBarItem = btn.to_interface::<ITfLangBarItemButton>().into();
+                    unsafe {
+                        let _ = lb_mgr.RemoveItem(&item);
+                    }
+                }
+            }
+        }
 
         if let Some(tm) = tm_opt {
             let g = active_guids();
@@ -333,36 +351,7 @@ impl TextService {
     }
 
     fn sync_mode_compartment(&self) {
-        let (tm_opt, tid, mode, chinese_punct) = {
-            let mut st = self.inner.borrow_mut();
-            if st.syncing_compartment {
-                return;
-            }
-            st.syncing_compartment = true;
-            (
-                st.thread_mgr.clone(),
-                st.tid,
-                st.session.mode(),
-                st.session.chinese_punct(),
-            )
-        };
-        if let Some(tm) = tm_opt {
-            set_compartment_i32(&tm, tid, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1);
-            let conv_val = match (mode, chinese_punct) {
-                (InputMode::Chinese, true) => {
-                    (TF_CONVERSIONMODE_NATIVE | TF_CONVERSIONMODE_SYMBOL) as i32
-                }
-                (InputMode::Chinese, false) => TF_CONVERSIONMODE_NATIVE as i32,
-                (InputMode::English, _) => 0,
-            };
-            set_compartment_i32(
-                &tm,
-                tid,
-                &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
-                conv_val,
-            );
-        }
-        self.inner.borrow_mut().syncing_compartment = false;
+        sync_mode_compartment_for(&self.inner);
     }
 
     fn show_toast_label(&self, pic: Option<&ITfContext>, label: &str) {
@@ -492,6 +481,30 @@ impl TextService_Impl {
         let cookie = unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &tm_sink)? };
         self.inner.borrow_mut().thread_mgr_cookie = cookie;
 
+        if let Ok(lb_mgr) = tm.cast::<ITfLangBarItemMgr>() {
+            let (init_mode, init_punct) = {
+                let st = self.inner.borrow();
+                (st.session.mode(), st.session.chinese_punct())
+            };
+            let weak_inner: Weak<RefCell<TextServiceState>> = Rc::downgrade(&self.inner);
+            let btn = ComObject::new(LangBarModeButton::new(
+                g.clsid,
+                init_mode,
+                init_punct,
+                Box::new(move || {
+                    if let Some(inner_rc) = weak_inner.upgrade() {
+                        toggle_mode_from_lang_bar(&inner_rc);
+                    }
+                }),
+            ));
+            let item: ITfLangBarItem = btn.to_interface::<ITfLangBarItemButton>().into();
+            if unsafe { lb_mgr.AddItem(&item) }.is_ok() {
+                self.inner.borrow_mut().lang_bar_btn = Some(btn);
+            } else {
+                btn.detach();
+            }
+        }
+
         self.sync_mode_compartment();
         if let Ok(cm) = tm.cast::<ITfCompartmentMgr>() {
             if let Ok(comp) =
@@ -537,17 +550,23 @@ impl TextService_Impl {
         }
     }
 
-    fn run_update_composition(&self, context: &ITfContext, preedit: String) {
-        self.run_update_composition_with_sync(context, preedit, true);
+    fn run_update_composition(&self, context: &ITfContext, preedit: String) -> (bool, Option<String>) {
+        self.run_update_composition_with_sync(context, preedit, true)
     }
 
-    fn run_update_composition_with_sync(&self, context: &ITfContext, preedit: String, sync: bool) {
+    fn run_update_composition_with_sync(
+        &self,
+        context: &ITfContext,
+        preedit: String,
+        sync: bool,
+    ) -> (bool, Option<String>) {
         let (tid, comp_slot, atom) = {
             let st = self.inner.borrow();
             (st.tid, Rc::clone(&st.composition), st.display_attr_atom)
         };
         let comp_sink: ITfCompositionSink = self.to_interface();
         let caret_out = Rc::new(RefCell::new(None));
+        let context_out = Rc::new(RefCell::new(None));
         let sess: ITfEditSession = UpdateCompositionSession::new(
             context.clone(),
             comp_slot,
@@ -555,6 +574,7 @@ impl TextService_Impl {
             preedit,
             atom,
             Rc::clone(&caret_out),
+            Rc::clone(&context_out),
         )
         .into();
         let flags = if sync {
@@ -562,16 +582,19 @@ impl TextService_Impl {
         } else {
             TF_ES_ASYNCDONTCARE | TF_ES_READWRITE
         };
-        let res = unsafe { context.RequestEditSession(tid, &sess, flags) };
+        let mut res = unsafe { context.RequestEditSession(tid, &sess, flags) };
         if sync && request_edit_session_failed(&res) {
-            let _ = unsafe {
+            res = unsafe {
                 context.RequestEditSession(tid, &sess, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
             };
         }
+        let ok = !request_edit_session_failed(&res);
         let new_caret = *caret_out.borrow();
         if new_caret.is_some() {
             self.inner.borrow_mut().last_caret_rect = new_caret;
         }
+        let pre_ctx = context_out.borrow().clone();
+        (ok, pre_ctx)
     }
 
     fn apply_shift_toggle_action(&self, pic: Option<&ITfContext>, action: KeyAction) {
@@ -588,12 +611,12 @@ impl TextService_Impl {
                         )
                     };
                     if let Some(ctx) = pic {
-                        self.run_update_composition_with_sync(ctx, preedit.clone(), false);
+                        let _ = self.run_update_composition_with_sync(ctx, preedit.clone(), false);
                     }
                     let resp = self.inner.borrow_mut().send_ipc(&IpcRequest::Convert {
                         session_id: sid,
                         context: ctx_text,
-                        keys: preedit,
+                        keys: preedit.clone(),
                         limit: 50,
                     });
                     if let Some(IpcResponse::Candidates {
@@ -607,15 +630,19 @@ impl TextService_Impl {
                         if config_revision != 0 && config_revision != st.config_revision {
                             st.sync_config_from_server(true);
                         }
+                    } else {
+                        let mut st = self.inner.borrow_mut();
+                        st.session.set_candidates(vec![preedit]);
                     }
                 }
                 self.inner.borrow_mut().render_candidates();
             }
             KeyAction::Commit { text, .. } => {
                 if let Some(ctx) = pic {
-                    self.run_commit_text_with_sync(ctx, text, false);
+                    self.run_commit_text(ctx, text);
                 }
                 let mut st = self.inner.borrow_mut();
+                st.last_test_key = None;
                 st.hide_candidate_window();
                 let sid = st.session_id;
                 let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
@@ -642,22 +669,40 @@ impl TextService_Impl {
         false
     }
 
-    fn execute_action(&self, context: &ITfContext, action: KeyAction) {
+    fn execute_action(&self, context: &ITfContext, action: KeyAction) -> bool {
         match action {
-            KeyAction::PassThrough | KeyAction::ConsumedNoChange => {}
+            KeyAction::PassThrough | KeyAction::ConsumedNoChange => true,
             KeyAction::PassThroughAndUndo => {
                 let mut st = self.inner.borrow_mut();
                 let sid = st.session_id;
                 let _ = st.send_ipc(&IpcRequest::Undo { session_id: sid });
+                true
             }
             KeyAction::UpdateComposition { need_convert } => {
                 let (preedit, sid) = {
                     let st = self.inner.borrow();
                     (st.session.keys().to_owned(), st.session_id)
                 };
-                self.run_update_composition(context, preedit.clone());
+                let (ok, pre_ctx) = self.run_update_composition(context, preedit.clone());
+                if !ok {
+                    let mut st = self.inner.borrow_mut();
+                    st.session.reset_composing();
+                    st.last_test_key = None;
+                    *st.composition.borrow_mut() = None;
+                    st.hide_candidate_window();
+                    return false;
+                }
                 if need_convert {
-                    let (ctx_text, caret) = self.read_context_and_caret(context);
+                    let (ctx_text, caret) = match pre_ctx {
+                        Some(ctx_s) if self.inner.borrow().last_caret_rect.is_some() => {
+                            (ctx_s, None)
+                        }
+                        Some(ctx_s) => {
+                            let (_, c) = self.read_context_and_caret(context);
+                            (ctx_s, c)
+                        }
+                        None => self.read_context_and_caret(context),
+                    };
                     let resp = {
                         let mut st = self.inner.borrow_mut();
                         st.last_context_text = ctx_text.clone();
@@ -667,7 +712,7 @@ impl TextService_Impl {
                         st.send_ipc(&IpcRequest::Convert {
                             session_id: sid,
                             context: ctx_text,
-                            keys: preedit,
+                            keys: preedit.clone(),
                             limit: 50,
                         })
                     };
@@ -682,8 +727,14 @@ impl TextService_Impl {
                         if config_revision != 0 && config_revision != st.config_revision {
                             st.sync_config_from_server(true);
                         }
+                    } else {
+                        let mut st = self.inner.borrow_mut();
+                        st.session.set_candidates(vec![preedit]);
                     }
                 } else {
+                    if let Some(ctx_s) = pre_ctx {
+                        self.inner.borrow_mut().last_context_text = ctx_s;
+                    }
                     if self.inner.borrow().last_caret_rect.is_none() {
                         let (ctx_text, caret) = self.read_context_and_caret(context);
                         let mut st = self.inner.borrow_mut();
@@ -695,12 +746,14 @@ impl TextService_Impl {
                     self.inner.borrow_mut().sync_config_from_server(false);
                 }
                 self.inner.borrow_mut().render_candidates();
+                true
             }
             KeyAction::Commit {
                 text,
                 learn_keys,
                 learn_text,
             } => {
+                let has_trailing_punct = learn_text.as_deref().is_some_and(|lt| text != lt);
                 self.run_commit_text(context, text);
                 let mut st = self.inner.borrow_mut();
                 st.hide_candidate_window();
@@ -713,9 +766,13 @@ impl TextService_Impl {
                         keys: lk,
                         text: lt,
                     });
+                    if has_trailing_punct {
+                        let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
+                    }
                 } else {
                     let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
                 }
+                true
             }
             KeyAction::CancelComposition => {
                 self.run_cancel_composition(context, true);
@@ -723,6 +780,7 @@ impl TextService_Impl {
                 st.hide_candidate_window();
                 let sid = st.session_id;
                 let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
+                true
             }
         }
     }
@@ -753,7 +811,17 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
 }
 
 impl ITfKeyEventSink_Impl for TextService_Impl {
-    fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
+        if !fforeground.as_bool() {
+            let mut st = self.inner.borrow_mut();
+            st.session.on_focus_change();
+            st.last_test_key = None;
+            *st.composition.borrow_mut() = None;
+            st.hide_candidate_window();
+        } else {
+            self.inner.borrow_mut().sync_config_from_server(false);
+            self.sync_mode_compartment();
+        }
         Ok(())
     }
 
@@ -763,6 +831,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: windows::Win32::Foundation::WPARAM,
         lparam: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
+        let tm_opt = self.inner.borrow().thread_mgr.clone();
+        if is_context_disabled(tm_opt.as_ref(), pic.as_ref()) {
+            let mut st = self.inner.borrow_mut();
+            if st.session.is_composing() {
+                st.session.reset_composing();
+                st.last_test_key = None;
+                *st.composition.borrow_mut() = None;
+                st.hide_candidate_window();
+            }
+            return Ok(BOOL(0));
+        }
+
         let vk = (wparam.0 & 0xFF) as u16;
         let is_repeat = ((lparam.0 as u32) & 0x4000_0000) != 0;
         let (ev, mods) = map_win_key(wparam.0, false);
@@ -840,6 +920,17 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: windows::Win32::Foundation::WPARAM,
         _lparam: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
+        let tm_opt = self.inner.borrow().thread_mgr.clone();
+        if is_context_disabled(tm_opt.as_ref(), pic.as_ref()) {
+            let mut st = self.inner.borrow_mut();
+            if st.session.is_composing() {
+                st.session.reset_composing();
+                st.last_test_key = None;
+                *st.composition.borrow_mut() = None;
+                st.hide_candidate_window();
+            }
+            return Ok(BOOL(0));
+        }
         let context = pic.ok()?;
         let vk = (wparam.0 & 0xFF) as u16;
         let (ev, mods) = {
@@ -855,8 +946,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         }
         let action = self.inner.borrow_mut().session.handle_key(ev, mods);
         let eaten = !matches!(action, KeyAction::PassThrough | KeyAction::PassThroughAndUndo);
-        self.execute_action(context, action);
-        Ok(BOOL::from(eaten))
+        let applied = self.execute_action(context, action);
+        Ok(BOOL::from(eaten && applied))
     }
 
     fn OnKeyUp(
@@ -919,7 +1010,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
 
     fn OnSetFocus(
         &self,
-        _pdimfocus: Ref<ITfDocumentMgr>,
+        pdimfocus: Ref<ITfDocumentMgr>,
         pdimprevfocus: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         if let Some(prev_dm) = pdimprevfocus.as_ref() {
@@ -927,15 +1018,24 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
                 self.run_cancel_composition(&prev_ctx, false);
             }
         }
-        let mut st = self.inner.borrow_mut();
-        st.session.on_focus_change();
-        st.last_test_key = None;
-        *st.composition.borrow_mut() = None;
-        st.last_caret_rect = None;
-        st.hide_candidate_window();
-        let sid = st.session_id;
-        let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
-        st.sync_config_from_server(false);
+        let tm_opt = {
+            let mut st = self.inner.borrow_mut();
+            st.session.on_focus_change();
+            st.last_test_key = None;
+            *st.composition.borrow_mut() = None;
+            st.last_caret_rect = None;
+            st.hide_candidate_window();
+            let sid = st.session_id;
+            let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
+            st.sync_config_from_server(false);
+            st.thread_mgr.clone()
+        };
+        if let Some(focus_dm) = pdimfocus.as_ref() {
+            let top_ctx = unsafe { focus_dm.GetTop() }.ok();
+            if !is_context_disabled(tm_opt.as_ref(), top_ctx.as_ref()) {
+                self.sync_mode_compartment();
+            }
+        }
         Ok(())
     }
 
@@ -990,6 +1090,9 @@ impl ITfCompartmentEventSink_Impl for TextService_Impl {
         if unsafe { *rguid } == GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION {
             let tm_opt = self.inner.borrow().thread_mgr.clone();
             if let Some(tm) = tm_opt {
+                if is_focused_context_disabled(&tm) {
+                    return Ok(());
+                }
                 if let Some(val) =
                     get_compartment_i32(&tm, &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION)
                 {
@@ -998,18 +1101,83 @@ impl ITfCompartmentEventSink_Impl for TextService_Impl {
                     } else {
                         InputMode::English
                     };
-                    let mut st = self.inner.borrow_mut();
-                    let old_mode = st.session.mode();
-                    if old_mode == InputMode::Chinese && new_mode == InputMode::Chinese {
-                        st.session
-                            .set_chinese_punct((val & (TF_CONVERSIONMODE_SYMBOL as i32)) != 0);
+                    let (btn_opt, final_mode, final_punct) = {
+                        let mut st = self.inner.borrow_mut();
+                        let old_mode = st.session.mode();
+                        if old_mode == InputMode::Chinese && new_mode == InputMode::Chinese {
+                            st.session
+                                .set_chinese_punct((val & (TF_CONVERSIONMODE_SYMBOL as i32)) != 0);
+                        }
+                        st.session.set_mode(new_mode);
+                        (
+                            st.lang_bar_btn.clone(),
+                            st.session.mode(),
+                            st.session.chinese_punct(),
+                        )
+                    };
+                    if let Some(btn) = btn_opt {
+                        btn.update_state(final_mode, final_punct);
                     }
-                    st.session.set_mode(new_mode);
                 }
             }
         }
         Ok(())
     }
+}
+
+fn sync_mode_compartment_for(inner: &Rc<RefCell<TextServiceState>>) {
+    let (tm_opt, tid, mode, chinese_punct, btn_opt) = {
+        let mut st = inner.borrow_mut();
+        if st.syncing_compartment {
+            return;
+        }
+        st.syncing_compartment = true;
+        (
+            st.thread_mgr.clone(),
+            st.tid,
+            st.session.mode(),
+            st.session.chinese_punct(),
+            st.lang_bar_btn.clone(),
+        )
+    };
+    if let Some(tm) = tm_opt {
+        set_compartment_i32(&tm, tid, &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1);
+        let conv_val = match (mode, chinese_punct) {
+            (InputMode::Chinese, true) => {
+                (TF_CONVERSIONMODE_NATIVE | TF_CONVERSIONMODE_SYMBOL) as i32
+            }
+            (InputMode::Chinese, false) => TF_CONVERSIONMODE_NATIVE as i32,
+            (InputMode::English, _) => 0,
+        };
+        set_compartment_i32(
+            &tm,
+            tid,
+            &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+            conv_val,
+        );
+    }
+    if let Some(btn) = btn_opt {
+        btn.update_state(mode, chinese_punct);
+    }
+    inner.borrow_mut().syncing_compartment = false;
+}
+
+fn toggle_mode_from_lang_bar(inner: &Rc<RefCell<TextServiceState>>) {
+    {
+        let mut st = inner.borrow_mut();
+        let next_mode = match st.session.mode() {
+            InputMode::Chinese => InputMode::English,
+            InputMode::English => InputMode::Chinese,
+        };
+        st.session.reset_composing();
+        st.session.set_mode(next_mode);
+        st.last_test_key = None;
+        *st.composition.borrow_mut() = None;
+        st.hide_candidate_window();
+        let sid = st.session_id;
+        let _ = st.send_ipc(&IpcRequest::ResetSession { session_id: sid });
+    }
+    sync_mode_compartment_for(inner);
 }
 
 fn set_compartment_i32(tm: &ITfThreadMgr, tid: u32, guid: &GUID, val: i32) {
@@ -1036,8 +1204,8 @@ fn set_compartment_i32(tm: &ITfThreadMgr, tid: u32, guid: &GUID, val: i32) {
     }
 }
 
-fn get_compartment_i32(tm: &ITfThreadMgr, guid: &GUID) -> Option<i32> {
-    let cm = tm.cast::<ITfCompartmentMgr>().ok()?;
+fn get_compartment_i32_from<T: Interface>(obj: &T, guid: &GUID) -> Option<i32> {
+    let cm = obj.cast::<ITfCompartmentMgr>().ok()?;
     let comp = unsafe { cm.GetCompartment(guid) }.ok()?;
     let mut var = unsafe { comp.GetValue() }.ok()?;
     let res = unsafe {
@@ -1051,6 +1219,33 @@ fn get_compartment_i32(tm: &ITfThreadMgr, guid: &GUID) -> Option<i32> {
         let _ = VariantClear(&mut var);
     }
     res
+}
+
+fn get_compartment_i32(tm: &ITfThreadMgr, guid: &GUID) -> Option<i32> {
+    get_compartment_i32_from(tm, guid)
+}
+
+fn is_context_disabled(tm: Option<&ITfThreadMgr>, context: Option<&ITfContext>) -> bool {
+    if let Some(ctx) = context {
+        if get_compartment_i32_from(ctx, &GUID_COMPARTMENT_KEYBOARD_DISABLED).unwrap_or(0) != 0 {
+            return true;
+        }
+        if get_compartment_i32_from(ctx, &GUID_COMPARTMENT_EMPTYCONTEXT).unwrap_or(0) != 0 {
+            return true;
+        }
+    }
+    if let Some(t) = tm {
+        if get_compartment_i32_from(t, &GUID_COMPARTMENT_KEYBOARD_DISABLED).unwrap_or(0) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_focused_context_disabled(tm: &ITfThreadMgr) -> bool {
+    let dm = unsafe { tm.GetFocus() }.ok();
+    let top = dm.and_then(|d| unsafe { d.GetTop() }.ok());
+    is_context_disabled(Some(tm), top.as_ref())
 }
 
 fn key_down(vk: u16) -> bool {
@@ -1246,6 +1441,22 @@ mod tests {
             // Repeat OnKeyUp must not double-toggle.
             let _ = key_sink.OnKeyUp(None, wp_shift, lp0);
             assert_eq!(imp.inner.borrow().session.mode(), InputMode::English);
+
+            // 5. Composing in Chinese mode + OnPreservedKey(VK_SHIFT) clears composing & switches to English.
+            assert!(key_sink.OnPreservedKey(None, &g.preserved_key_shift).unwrap().as_bool());
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::Chinese);
+            {
+                let mut st = imp.inner.borrow_mut();
+                for ch in ['h', 'e', 'l', 'l', 'o'] {
+                    st.session.handle_key(KeyEvent::Char(ch), KeyModifiers::default());
+                }
+                assert!(st.session.is_composing());
+                assert_eq!(st.session.keys(), "hello");
+            }
+            assert!(key_sink.OnPreservedKey(None, &g.preserved_key_shift).unwrap().as_bool());
+            assert_eq!(imp.inner.borrow().session.mode(), InputMode::English);
+            assert!(!imp.inner.borrow().session.is_composing());
+            assert_eq!(imp.inner.borrow().session.keys(), "");
         }
         drop(key_sink);
         drop(tip);

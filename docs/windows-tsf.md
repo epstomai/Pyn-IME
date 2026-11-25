@@ -42,19 +42,19 @@
 | `DllMain` 约束 | `DLL_PROCESS_ATTACH` 仅保存 `HINSTANCE`，严禁初始化 COM、创建窗口、启动子进程或连接 Named Pipe |
 | EditSession 与光标兼容 | 读上文使用 `TF_ES_READ`；同步锁失败时自动回退 `TF_ES_ASYNCDONTCARE`；无现有组合时以瞬时组合包裹提交以兼容 CUAS/QQ/Electron；TSF `GetTextExt` 缺失时回退 `GetGUIThreadInfo` + `ClientToScreen` |
 
-## 3. 按键与交互映射（`SessionController` 与中途 `Shift` 切英文候选）
+## 3. 按键与交互映射（`SessionController` 与 `Shift` 上屏切英文）
 
 状态机实现在无 Win32 依赖的 [session.rs](../crates/ime-ipc/src/session.rs) 与英文前缀补全模块 [english.rs](../crates/ime-ipc/src/english.rs)：
 
 | 场景 | 按键 | 行为说明 |
 |---|---|---|
 | 空闲（中文模式） | `a–z` | 启动拼音组合并读取光标前最多 `32` 字上文发起转换 |
-| 空闲（中文模式） | `Shift+A–Z`（`CapsLock` 关闭时） | 从首个大写字母直接进入输入法英文组合（如 `NiloToon` 完整保留在候选栏内，`Space`/`Enter` 上屏后仍保持中文模式，`Backspace` 删空自动退出，不误切中英；误按首字大写时单击 `Shift` 可原地转小写切回中文候选） |
+| 空闲（中文模式） | `Shift+A–Z`（`CapsLock` 关闭时） | 从首个大写字母直接进入输入法英文组合（如 `NiloToon` 完整保留在候选栏内，`Space`/`Enter` 上屏后仍保持中文模式，`Backspace` 删空自动退出，不误切中英；按 `Shift` 可立即将已输入英文上屏并切为英文模式） |
 | 空闲（中文模式） | `, . ? ! ; : ( ) < > \ " ' ^ _` | 当处于中文标点模式（默认，`，。`）时直接上屏对应中文全角标点（`"`/`'` 交替配对 `“”`/`‘’`）；按 **`Ctrl + .`** 切为英文标点（`,.`）后全部直出半角英文符号（无需切换英文键盘） |
 | 任意时刻（空闲 / 组合中） | **`Ctrl + .`**（`PreserveKey(VK_OEM_PERIOD, TF_MOD_CONTROL)` + 键sink回退） | 切换「中文标点（`，。` / 徽章 `中`） ↔ 英文标点（`,.` / 徽章 `中.`）」并同步 `TF_CONVERSIONMODE_SYMBOL`；保持中文打字模式不变，组合中途输入标点时自动提交「候选词 + 半角英文符号」 |
-| 空闲 | 单击 `Shift`（`PreserveKey(VK_SHIFT, TF_MOD_ON_KEYUP)` -> `OnPreservedKey` + `OnTestKeyUp`/`OnKeyUp` + 丢 `KeyUp` 恢复） | 在 Windows 11 / Chromium / Electron / QQ 中可靠切换「中 ↔ 英」模式并通过 `ITfCompartmentEventSink` 与任务栏指示器双向同步，光标处弹出 850 ms `中` / `英` 状态浮标；带组合键（如 `Shift+N`/`Shift+(`/`Ctrl+Shift`）与长按 repeat 保护 |
+| 空闲 | 单击 `Shift`（`PreserveKey(VK_SHIFT, TF_MOD_ON_KEYUP)` -> `OnPreservedKey` + `OnTestKeyUp`/`OnKeyUp` + 丢 `KeyUp` 恢复）或点击任务栏托盘 `中`/`英` 图标 | 在 Windows 11 / Chromium / Electron / QQ 中可靠切换「中 ↔ 英」模式，通过 `ITfCompartmentEventSink` 与任务栏 **`GUID_LBI_INPUTMODE`** 托盘模式图标（DPI 自适应深浅色 `中` / `英` 图标，中文+英文标点时右下角带细点提示）双向实时同步，光标处弹出 850 ms `中` / `英` 状态浮标；带组合键（如 `Shift+N`/`Shift+(`/`Ctrl+Shift`）与长按 repeat 保护 |
 | 空闲（刚上屏中文候选后） | `Backspace` | 键事件放行让宿主应用删除误选文字，同时向 `ime-server` 发送 `Undo` 触发回滚与惩罚门槛 |
-| 组合态（中途切换中/英候选） | 单击 `Shift`（`OnPreservedKey` + `OnTestKeyUp`/`OnKeyUp` + 丢 `KeyUp` 恢复） | **保留当前已输入编码不清空**并切换「中 ↔ 英」：切英立即以原编码置顶 + 内置 1,410 词表前缀补全直接生成英文候选（不锁定后续中文输入）；切中转小写并重算中文候选；无任何自动英文识别以免长拼音/错拼被误锁 |
+| 组合态（中文模式下中途切英文） | 单击 `Shift`（`OnPreservedKey` + `OnTestKeyUp`/`OnKeyUp` + 丢 `KeyUp` 恢复） | **立即把当前输入的原始英文编码上屏到输入框，并切换为英文模式**（不写入中文自学习，隐藏候选窗并弹出 `英` 浮标），后续按键直出英文；带组合键与长按 repeat 保护 |
 | 组合态（大写驼峰 / 符号 / 小键盘 / CapsLock） | `Shift+A–Z` / `CapsLock A–Z` / `0` / `/` / `RawChar` 符号与小键盘键 | `UpperChar`（如 `NiloToon` 途中按 `Shift+T`）追加进当前编码并临时展示英文候选，退格删回纯小写立即恢复中文（不再放行造成前插错位）；`CapsLock` 字母与 `0`、`/`、`RawChar` 同步提交「已输入编码+符号」结束组合且不锁定英文模式 |
 | 组合态 | `a–z` / `'` / `Backspace` | 追加拼音（或英文字符）/ 音节分隔符 `'` / 回退编码；退空自动取消组合并隐藏候选窗 |
 | 组合态 | `Space` / `1–5` | 提交高亮候选或本页第 1–5 项（英文组合态下提交英文且不写入中文学习；首字母大写进入的英文组合提交后自动保持中文模式） |

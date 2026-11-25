@@ -428,7 +428,60 @@ pub fn decode_with_user(
             }
         })
         .collect();
-    finalize_candidates(reranker, context_text, scored, limit, cfg)
+    let mut outcome = finalize_candidates(reranker, context_text, scored, limit, cfg);
+    if let Some(user_mem) = active_user {
+        if limit >= 2 && !outcome.candidates.is_empty() && dag.exact_only {
+            let staged = collect_staged_oovs_for_dag(&dag, user_mem);
+            if let Some(word) = staged.into_iter().next() {
+                if outcome.candidates[0] != word {
+                    outcome.candidates.retain(|c| c != &word);
+                    outcome.candidates.insert(1, word);
+                    if outcome.candidates.len() > limit {
+                        outcome.candidates.truncate(limit);
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+fn collect_staged_oovs_for_dag(dag: &PinyinDag, user: &UserMemory) -> Vec<String> {
+    fn dfs(
+        dag: &PinyinDag,
+        user: &UserMemory,
+        pos: usize,
+        len: usize,
+        syls: &mut [u16; 6],
+        out: &mut Vec<String>,
+    ) {
+        if pos == dag.len {
+            if len >= 2 {
+                if let Some(key) = pack_exact(&syls[..len]) {
+                    for w in user.staged_oov_for_key(key) {
+                        if !out.contains(&w) {
+                            out.push(w);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if len >= 6 {
+            return;
+        }
+        for edge in &dag.edges_from[pos] {
+            if let DagEdgeKind::Exact(syl) = edge.kind {
+                syls[len] = syl;
+                dfs(dag, user, edge.end, len + 1, syls, out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut syls = [0u16; 6];
+    dfs(dag, user, 0, 0, &mut syls, &mut out);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]

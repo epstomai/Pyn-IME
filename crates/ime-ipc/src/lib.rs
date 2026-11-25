@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(s.mode(), InputMode::Chinese);
         s.handle_key(KeyEvent::Escape, none);
 
-        // 2. Typing mid-composition + tapping Shift switches candidates directly to English without committing.
+        // 2. Typing mid-composition in Chinese mode + tapping Shift immediately commits raw keys and switches to English.
         for ch in ['h', 'e', 'l'] {
             assert_eq!(
                 s.handle_key(KeyEvent::Char(ch), none),
@@ -254,61 +254,47 @@ mod tests {
         s.note_test_key(KeyEvent::ShiftDown, shift);
         assert_eq!(
             s.handle_key(KeyEvent::ShiftUp, none),
-            KeyAction::UpdateComposition {
-                need_convert: false
-            }
-        );
-        assert_eq!(s.mode(), InputMode::English);
-        assert!(s.is_composing());
-        assert!(s.is_english_composing());
-        assert_eq!(s.keys(), "hel");
-        let page = s.current_page().2;
-        assert_eq!(page.first().map(String::as_str), Some("hel"));
-        assert!(page.iter().any(|c| c == "hello"));
-
-        // Continuing to type updates English candidates locally with zero IPC, Space commits English.
-        assert_eq!(
-            s.handle_key(KeyEvent::Char('l'), none),
-            KeyAction::UpdateComposition {
-                need_convert: false
-            }
-        );
-        assert_eq!(
-            s.handle_key(KeyEvent::Char('o'), none),
-            KeyAction::UpdateComposition {
-                need_convert: false
-            }
-        );
-        assert_eq!(s.current_page().2.first().map(String::as_str), Some("hello"));
-
-        // Tapping Shift again mid-composition switches back to Chinese and requests conversion.
-        s.note_test_key(KeyEvent::ShiftDown, shift);
-        assert_eq!(
-            s.handle_key(KeyEvent::ShiftUp, none),
-            KeyAction::UpdateComposition { need_convert: true }
-        );
-        assert_eq!(s.mode(), InputMode::Chinese);
-        assert!(!s.is_english_composing());
-
-        // Chromium dropped-ShiftUp mid-composition also switches directly to English candidates.
-        s.note_test_key(KeyEvent::ShiftDown, shift);
-        assert_eq!(
-            s.consume_dropped_shift_tap(KeyEvent::Space, none),
-            Some(KeyAction::UpdateComposition {
-                need_convert: false
-            })
-        );
-        assert_eq!(s.mode(), InputMode::English);
-        assert_eq!(
-            s.handle_key(KeyEvent::Space, none),
             KeyAction::Commit {
-                text: "hello".into(),
+                text: "hel".into(),
                 learn_keys: None,
                 learn_text: None,
             }
         );
-        // Idle English mode passes keys through; tap Shift to return to Chinese.
+        assert_eq!(s.mode(), InputMode::English);
+        assert!(!s.is_composing());
+        assert_eq!(s.keys(), "");
+        // Subsequent English keys pass straight through to the application.
+        assert!(!s.should_consume(KeyEvent::Char('l'), none));
+        assert!(!s.should_consume(KeyEvent::Char('o'), none));
+
+        // Tap Shift while idle to return to Chinese.
+        s.note_test_key(KeyEvent::ShiftDown, shift);
+        assert_eq!(s.handle_key(KeyEvent::ShiftUp, none), KeyAction::ConsumedNoChange);
+        assert_eq!(s.mode(), InputMode::Chinese);
+
+        // Chromium dropped-ShiftUp mid-composition also immediately commits raw keys and switches to English,
+        // allowing the next key to pass straight through into the input box.
+        for ch in ['h', 'e', 'l', 'l', 'o'] {
+            assert_eq!(
+                s.handle_key(KeyEvent::Char(ch), none),
+                KeyAction::UpdateComposition { need_convert: true }
+            );
+        }
+        s.note_test_key(KeyEvent::ShiftDown, shift);
+        assert_eq!(
+            s.consume_dropped_shift_tap(KeyEvent::Space, none),
+            Some(KeyAction::Commit {
+                text: "hello".into(),
+                learn_keys: None,
+                learn_text: None,
+            })
+        );
+        assert_eq!(s.mode(), InputMode::English);
+        assert!(!s.is_composing());
+        assert!(!s.should_consume(KeyEvent::Space, none));
         assert!(!s.should_consume(KeyEvent::Char('a'), none));
+
+        // Tap Shift to return to Chinese.
         s.note_test_key(KeyEvent::ShiftDown, shift);
         assert_eq!(s.handle_key(KeyEvent::ShiftUp, none), KeyAction::ConsumedNoChange);
         assert_eq!(s.mode(), InputMode::Chinese);
@@ -393,7 +379,7 @@ mod tests {
         );
         assert_eq!(s.mode(), InputMode::Chinese);
 
-        // 3b. Accidental capital letter while intending Chinese (`Nihao` + Shift tap) switches directly to Chinese.
+        // 3b. Uppercase-started English composing in Chinese mode + solo Shift tap also immediately commits raw text and switches to English.
         s.handle_key(KeyEvent::UpperChar('N'), shift);
         for ch in ['i', 'h', 'a', 'o'] {
             s.handle_key(KeyEvent::Char(ch), none);
@@ -402,12 +388,19 @@ mod tests {
         s.note_test_key(KeyEvent::ShiftDown, shift);
         assert_eq!(
             s.handle_key(KeyEvent::ShiftUp, none),
-            KeyAction::UpdateComposition { need_convert: true }
+            KeyAction::Commit {
+                text: "Nihao".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
         );
+        assert_eq!(s.mode(), InputMode::English);
+        assert!(!s.is_composing());
+        assert_eq!(s.keys(), "");
+        // Return to Chinese mode for the remaining checks.
+        s.note_test_key(KeyEvent::ShiftDown, shift);
+        assert_eq!(s.handle_key(KeyEvent::ShiftUp, none), KeyAction::ConsumedNoChange);
         assert_eq!(s.mode(), InputMode::Chinese);
-        assert!(!s.is_english_composing());
-        assert_eq!(s.keys(), "nihao");
-        s.handle_key(KeyEvent::Escape, none);
 
         // 3c. Mid-word Shift+T during lowercase Chinese composing also keeps English composing, Backspace reverts.
         for ch in ['i', 'l', 'o'] {
@@ -532,27 +525,27 @@ mod tests {
         assert_eq!(s.take_preserved_shift_tap(), Some(KeyAction::ConsumedNoChange));
         assert_eq!(s.mode(), InputMode::Chinese);
 
-        // 4. Mid-composition preserved Shift tap flips Chinese <-> English candidates cleanly.
+        // 4. Mid-composition preserved Shift tap in Chinese mode immediately commits raw keys and switches to English.
         for ch in ['h', 'e', 'l'] {
             s.handle_key(KeyEvent::Char(ch), none);
         }
         s.set_candidates(vec!["喝了".into()]);
         assert_eq!(
             s.take_preserved_shift_tap(),
-            Some(KeyAction::UpdateComposition {
-                need_convert: false
+            Some(KeyAction::Commit {
+                text: "hel".into(),
+                learn_keys: None,
+                learn_text: None,
             })
         );
         assert_eq!(s.mode(), InputMode::English);
-        assert!(s.is_english_composing());
-        assert_eq!(s.keys(), "hel");
+        assert!(!s.is_composing());
+        assert_eq!(s.keys(), "");
         assert_eq!(
             s.take_preserved_shift_tap(),
-            Some(KeyAction::UpdateComposition { need_convert: true })
+            Some(KeyAction::ConsumedNoChange)
         );
         assert_eq!(s.mode(), InputMode::Chinese);
-        assert!(!s.is_english_composing());
-        s.handle_key(KeyEvent::Escape, none);
 
         // 5. Toggle English punctuation while staying in Chinese mode.
         assert!(s.chinese_punct());

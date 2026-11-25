@@ -12,7 +12,9 @@ use ime_core::user_dict::LearnDelta;
 use ime_core::{DecoderConfig, LearnConfig, Model, Reranker, UserMemory};
 use ime_ipc::config::ImeConfig;
 use ime_ipc::pipe::{to_wide_null, NamedPipeClient, NamedPipeServerInstance};
-use ime_ipc::protocol::{read_frame, write_frame, IpcRequest, IpcResponse, DEFAULT_PIPE_NAME};
+use ime_ipc::protocol::{
+    read_frame, write_frame, IpcRequest, IpcResponse, DEFAULT_PIPE_NAME, LEGACY_PIPE_NAME,
+};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -487,10 +489,35 @@ fn serve_connection(mut pipe: NamedPipeServerInstance, ctx: Arc<ServerCtx>) {
             break;
         }
         if is_shutdown {
-            // Wake main accept() loop cleanly if it is waiting on ConnectNamedPipe.
+            // Wake accept() loops cleanly if they are waiting on ConnectNamedPipe.
             let _ = NamedPipeClient::connect(&ctx.pipe_name, 200);
+            if ctx.pipe_name == DEFAULT_PIPE_NAME {
+                let _ = NamedPipeClient::connect(LEGACY_PIPE_NAME, 200);
+            }
             break;
         }
+    }
+}
+
+fn serve_pipe_loop(ctx: Arc<ServerCtx>, pipe_name: String) {
+    while !ctx.shutdown.load(Ordering::SeqCst) {
+        let pipe = match NamedPipeServerInstance::create(&pipe_name) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("ime-server: CreateNamedPipeW({pipe_name}) failed: {err}");
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+        if let Err(err) = pipe.accept() {
+            eprintln!("ime-server: ConnectNamedPipe({pipe_name}) failed: {err}");
+            continue;
+        }
+        if ctx.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let ctx_cloned = Arc::clone(&ctx);
+        std::thread::spawn(move || serve_connection(pipe, ctx_cloned));
     }
 }
 
@@ -610,24 +637,19 @@ fn main() {
         }),
     });
 
-    while !ctx.shutdown.load(Ordering::SeqCst) {
-        let pipe = match NamedPipeServerInstance::create(&ctx.pipe_name) {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("ime-server: CreateNamedPipeW failed: {err}");
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-        };
-        if let Err(err) = pipe.accept() {
-            eprintln!("ime-server: ConnectNamedPipe failed: {err}");
-            continue;
-        }
-        if ctx.shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        let ctx_cloned = Arc::clone(&ctx);
-        std::thread::spawn(move || serve_connection(pipe, ctx_cloned));
+    let legacy_thread = if ctx.pipe_name == DEFAULT_PIPE_NAME {
+        let legacy_ctx = Arc::clone(&ctx);
+        Some(std::thread::spawn(move || {
+            serve_pipe_loop(legacy_ctx, LEGACY_PIPE_NAME.to_owned());
+        }))
+    } else {
+        None
+    };
+
+    serve_pipe_loop(Arc::clone(&ctx), ctx.pipe_name.clone());
+
+    if let Some(handle) = legacy_thread {
+        let _ = handle.join();
     }
 
     maybe_flush_user_dict(&ctx, true);

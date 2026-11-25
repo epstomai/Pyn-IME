@@ -24,8 +24,37 @@ LANGID_STR = "0x00000804"
 ZH_CN_ASSEMBLY_KEY = rf"Software\Microsoft\CTF\Assemblies\{LANGID_STR}\{{34745C63-B2F0-4784-8B67-5E12C8701A31}}"
 GEN_FILE = "generation.txt"
 CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
+LOTP_DISABLED = 0x00000002
+RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "PynServer"
 _GEN_DLL_RE = re.compile(r"^ime_tsf(?:_x86)?_g([0-9a-f]{4})\.dll$", re.IGNORECASE)
+_TIP_ID_RE = re.compile(r"^0804:(\{[0-9A-F-]+\})(\{[0-9A-F-]+\})$", re.IGNORECASE)
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _LAYOUTORTIPPROFILE(ctypes.Structure):
+    _fields_ = [
+        ("dwProfileType", ctypes.c_uint32),
+        ("langid", ctypes.c_uint16),
+        ("clsid", _GUID),
+        ("guidProfile", _GUID),
+        ("catid", _GUID),
+        ("dwSubstituteLayout", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
+        ("szId", ctypes.c_wchar * 260),
+    ]
 
 
 def is_admin() -> bool:
@@ -210,6 +239,115 @@ def _get_current_default_zh_cn_tip() -> tuple[str | None, str | None]:
         return (None, None)
 
 
+def _get_primary_language() -> str | None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\CTF\SortOrder\Language") as k:
+            val, _ = winreg.QueryValueEx(k, "00000000")
+            return str(val).strip().lower()
+    except OSError:
+        return None
+
+
+def _enum_enabled_zh_cn_tips() -> set[tuple[str, str]]:
+    enabled: set[tuple[str, str]] = set()
+    try:
+        input_dll = ctypes.WinDLL("input.dll")
+        enum_fn = input_dll.EnumEnabledLayoutOrTip
+        enum_fn.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(_LAYOUTORTIPPROFILE),
+            ctypes.c_uint32,
+        ]
+        enum_fn.restype = ctypes.c_uint32
+        cnt = enum_fn(None, None, None, None, 0)
+        if cnt == 0:
+            return enabled
+        buf = (_LAYOUTORTIPPROFILE * cnt)()
+        got = enum_fn(None, None, None, buf, cnt)
+        for i in range(got):
+            p = buf[i]
+            if p.langid != 0x0804 or (p.dwFlags & LOTP_DISABLED) != 0:
+                continue
+            m = _TIP_ID_RE.match(p.szId.strip())
+            if m:
+                enabled.add((m.group(1).upper(), m.group(2).upper()))
+    except Exception:
+        pass
+    return enabled
+
+
+def _cleanup_stale_hkcu_tips(keep_gen: int | None) -> None:
+    tip_root = r"Software\Microsoft\CTF\TIP"
+    for sub in _enum_subkeys(winreg.HKEY_CURRENT_USER, tip_root):
+        g = parse_generation_from_clsid(sub)
+        if g is not None and g != keep_gen:
+            _delete_key_tree(winreg.HKEY_CURRENT_USER, rf"{tip_root}\{sub}", 0)
+
+
+def _ensure_zh_cn_default_tip(new_gen: int, old_gens: list[int]) -> bool:
+    new_clsid, new_prof = guids_for_generation(new_gen)
+    new_tip_id = tip_id_for_generation(new_gen)
+
+    # Mark this generation's zh-CN language profile explicitly enabled in HKCU.
+    hkcu_prof_key = rf"Software\Microsoft\CTF\TIP\{new_clsid}\LanguageProfile\{LANGID_STR}\{new_prof}"
+    try:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, hkcu_prof_key, 0, winreg.KEY_WRITE
+        ) as k:
+            winreg.SetValueEx(k, "Enable", 0, winreg.REG_DWORD, 1)
+    except OSError:
+        pass
+
+    cur_clsid, cur_prof = _get_current_default_zh_cn_tip()
+    was_old_pyn = any(
+        cur_clsid == guids_for_generation(g)[0] and cur_prof == guids_for_generation(g)[1]
+        for g in old_gens
+    )
+    enabled_zh = _enum_enabled_zh_cn_tips()
+    cur_missing_or_disabled = (
+        not cur_clsid
+        or not cur_prof
+        or (cur_clsid, cur_prof) not in enabled_zh
+    )
+
+    updated = False
+    if was_old_pyn or cur_missing_or_disabled:
+        try:
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER, ZH_CN_ASSEMBLY_KEY, 0, winreg.KEY_WRITE
+            ) as k:
+                winreg.SetValueEx(k, "Default", 0, winreg.REG_SZ, new_clsid)
+                winreg.SetValueEx(k, "Profile", 0, winreg.REG_SZ, new_prof)
+            updated = True
+        except OSError:
+            pass
+        if was_old_pyn and _get_primary_language() == "00000804":
+            set_default_layout_or_tip(new_tip_id, 0)
+    return updated
+
+
+def _set_startup_run_entry(srv_exe: Path) -> None:
+    try:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_WRITE
+        ) as k:
+            winreg.SetValueEx(k, RUN_VALUE_NAME, 0, winreg.REG_SZ, f'"{srv_exe}"')
+    except OSError:
+        pass
+
+
+def _remove_startup_run_entry() -> None:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_SET_VALUE
+        ) as k:
+            winreg.DeleteValue(k, RUN_VALUE_NAME)
+    except OSError:
+        pass
+
+
 def _delete_key_tree(root: int, subkey: str, wow64_flag: int = 0) -> None:
     children = _enum_subkeys(root, subkey, wow64_flag)
     for child in children:
@@ -276,6 +414,7 @@ def _unregister_generation(gen: int) -> None:
         winreg.KEY_WOW64_32KEY,
     )
     _delete_key_tree(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\CTF\TIP\{clsid}", 0)
+    _delete_key_tree(winreg.HKEY_CURRENT_USER, rf"Software\Microsoft\CTF\TIP\{clsid}", 0)
 
     cat_root = r"SOFTWARE\Microsoft\CTF\Category\Category"
     for cat_guid in _enum_subkeys(winreg.HKEY_LOCAL_MACHINE, cat_root):
@@ -437,14 +576,10 @@ def cmd_deploy(args) -> None:
         check=True,
     )
 
+    _set_startup_run_entry(dst_srv)
+
     if old_gens and not args.no_hotswap:
         new_tip_id = tip_id_for_generation(new_gen)
-        cur_def_clsid, cur_def_prof = _get_current_default_zh_cn_tip()
-        was_default = any(
-            cur_def_clsid == guids_for_generation(g)[0]
-            and cur_def_prof == guids_for_generation(g)[1]
-            for g in old_gens
-        )
 
         subprocess.run([str(_regsvr32_path(x86=True)), "/s", str(dst_x86)], check=True)
         subprocess.run([str(_regsvr32_path(x86=False)), "/s", str(dst_x64)], check=True)
@@ -454,13 +589,13 @@ def cmd_deploy(args) -> None:
         for og in old_gens:
             install_layout_or_tip(tip_id_for_generation(og), 1)
 
-        if was_default:
-            set_default_layout_or_tip(new_tip_id, 0)
+        _ensure_zh_cn_default_tip(new_gen, old_gens)
 
         activated = _activate_session(dst_x64)
 
         for og in old_gens:
             _unregister_generation(og)
+        _cleanup_stale_hkcu_tips(new_gen)
 
         locked = _cleanup_obsolete_dlls(target_dir, {x64_name, x86_name})
         old_str = ", ".join(f"g{g:04x}" for g in old_gens)
@@ -522,6 +657,8 @@ def cmd_register(args) -> None:
 
     for og in old_gens:
         _unregister_generation(og)
+    _ensure_zh_cn_default_tip(target_gen, old_gens)
+    _cleanup_stale_hkcu_tips(target_gen)
 
     activated = _activate_session(dll)
     x86_msg = f" + 32-bit ({dll_x86})" if dll_x86.exists() else ""
@@ -556,6 +693,8 @@ def cmd_unregister(args) -> None:
 
     for g in gens:
         _unregister_generation(g)
+    _cleanup_stale_hkcu_tips(None)
+    _remove_startup_run_entry()
     _cleanup_obsolete_dlls(base_dir, set())
     gen_str = ", ".join(f"g{g:04x}" for g in gens)
     print(f"unregistered all Pyn TSF generations: {gen_str}")
@@ -567,14 +706,26 @@ def cmd_start(args) -> None:
         srv = ROOT / "target" / "release" / "ime-server.exe"
     if not srv.exists():
         raise SystemExit(f"ime-server.exe not found in {args.dir} or target/release")
-    subprocess.Popen(
-        [str(srv)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=CREATE_NO_WINDOW,
-    )
-    print(f"started background daemon: {srv}")
+    base_flags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(
+            [str(srv)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=base_flags | CREATE_BREAKAWAY_FROM_JOB,
+            close_fds=True,
+        )
+    except OSError:
+        subprocess.Popen(
+            [str(srv)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=base_flags,
+            close_fds=True,
+        )
+    print(f"started detached background daemon: {srv}")
 
 
 def _create_settings_shortcut(target_exe: Path) -> None:

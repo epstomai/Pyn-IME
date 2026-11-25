@@ -7,6 +7,7 @@ mod display_attr;
 mod edit_session;
 mod globals;
 pub mod guids;
+mod lang_bar;
 mod register;
 mod text_service;
 

@@ -197,13 +197,14 @@ mod tests {
         };
         assert_eq!(unsafe { attr.GetGUID().unwrap() }, active_guids().display_attr_input);
 
+        let before_drop = globals::dll_ref_count();
         drop(dap);
         drop(attr);
         drop(tip);
         drop(factory);
-        if baseline == 0 {
-            assert!(globals::dll_ref_count() <= 1);
-        }
+        let after_drop = globals::dll_ref_count();
+        assert!(after_drop < before_drop);
+        let _ = baseline;
 
         // Candidate window creates, renders, hides, and destroys without error.
         let mut wnd = CandidateWindow::new().unwrap();

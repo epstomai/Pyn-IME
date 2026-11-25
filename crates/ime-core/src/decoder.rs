@@ -529,6 +529,12 @@ fn try_decode_single_unit(
         return Some(DecodeOutcome::default());
     }
 
+    // Without preceding Chinese context, rank single-letter initial shorthands (`d` -> `的`,
+    // `l` -> `了`, `j` -> `就`, `g` -> `个`, etc.) by unigram prior + reading probability
+    // instead of `<bos> X <eos>` standalone-sentence probability (which favors `对`/`来`/`据`).
+    let nocontext_single_abbrev =
+        !ctx.has_context && matches!(edges[0].kind, DagEdgeKind::Abbrev(_));
+
     let mut joined_buf = String::with_capacity(24);
     let mut scored: Vec<ScoredCandidate> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -536,8 +542,16 @@ fn try_decode_single_unit(
         if word.is_empty() {
             continue;
         }
-        let mut best_lm = model.trigram_logp(ctx.h1, ctx.h2, entry.word_id)
-            + eff_eos * model.trigram_logp(ctx.h2, entry.word_id, EOS_ID);
+        let mut best_lm = if nocontext_single_abbrev {
+            model
+                .unigram_logp
+                .get(entry.word_id as usize)
+                .copied()
+                .unwrap_or(-20.0)
+        } else {
+            model.trigram_logp(ctx.h1, ctx.h2, entry.word_id)
+                + eff_eos * model.trigram_logp(ctx.h2, entry.word_id, EOS_ID)
+        };
         let mut best_ac = cfg.reading_weight * entry.reading_logp;
         let mut best_total = best_lm + best_ac;
 
@@ -572,7 +586,8 @@ fn try_decode_single_unit(
             has_oov: false,
         });
     }
-    Some(finalize_candidates(reranker, context_text, scored, limit, cfg))
+    let rr = if nocontext_single_abbrev { None } else { reranker };
+    Some(finalize_candidates(rr, context_text, scored, limit, cfg))
 }
 
 fn finalize_candidates(

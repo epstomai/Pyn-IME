@@ -524,6 +524,11 @@ mod tests {
         // Polyphone reading_logp separates 地 (di) from 的 (de)
         assert_eq!(engine.convert("di", 5).first().map(String::as_str), Some("地"));
 
+        // Zero-context single-letter shorthand ranks by unigram prior (`d` -> `的`, `l` -> `了`)
+        // instead of `<bos> X <eos>` standalone sentence probability.
+        assert_eq!(engine.convert("d", 5).first().map(String::as_str), Some("的"));
+        assert_eq!(engine.convert("l", 5).first().map(String::as_str), Some("了"));
+
         // Punctuation resets or pauses cleanly
         assert_eq!(loaded.context_history("你好。"), (crate::model::NONE_ID, BOS_ID));
         assert_eq!(loaded.context_history("我，"), (10, PAUSE_ID));

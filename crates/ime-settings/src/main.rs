@@ -4,7 +4,9 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use std::collections::HashSet;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::ptr::null_mut;
 
 use ime_ipc::config::{CandidateLayout, HighlightStyle, ImeConfig, ThemeMode};
@@ -55,7 +57,7 @@ const CLASS_NAME: &str = "PynSettingsWnd";
 const WINDOW_TITLE: &str = "Pyn 设置";
 const MUTEX_NAME: &str = r"Local\PynSettingsMutex_v1";
 const LOGICAL_W: i32 = 580;
-const LOGICAL_H: i32 = 746;
+const LOGICAL_H: i32 = 780;
 
 const CURATED_CJK_FONTS: &[&str] = &[
     "MiSans",
@@ -423,6 +425,7 @@ enum ControlAction {
     ToggleCaret,
     ToggleToast,
     ToggleLearning,
+    OpenUserDictLocation,
     ResetDefaults,
     CloseWindow,
 }
@@ -1268,7 +1271,8 @@ unsafe fn render_settings_surface(
         ("启用本地词频自学习", state.config.learning_enabled, ControlAction::ToggleLearning),
     ];
     let t_row_h = px(32);
-    let card3_h = t_row_h * (toggle_rows.len() as i32);
+    let dict_row_h = px(34);
+    let card3_h = t_row_h * (toggle_rows.len() as i32) + dict_row_h;
     draw_aa_rounded_rect(
         pixels,
         w,
@@ -1343,6 +1347,56 @@ unsafe fn render_settings_surface(
                 bottom: ry + t_row_h,
             },
             action,
+        });
+    }
+
+    // Row 7 in Card 3: 打开本地词库位置
+    {
+        let ry = y + (toggle_rows.len() as i32) * t_row_h;
+        fill_rect_px(pixels, w, h, card_x0 + 1, ry, card_x1 - 1, ry + 1, pal.divider);
+        let open_w = px(80);
+        let open_h = px(24);
+        let open_rc = RECT {
+            left: card_x1 - row_pad_x - open_w,
+            top: ry + (dict_row_h - open_h) / 2,
+            right: card_x1 - row_pad_x,
+            bottom: ry + (dict_row_h + open_h) / 2,
+        };
+        labels.push(PendingLabel {
+            text: "本地词库位置".to_owned(),
+            rc: RECT {
+                left: card_x0 + row_pad_x,
+                top: ry,
+                right: open_rc.left - px(12),
+                bottom: ry + dict_row_h,
+            },
+            color: pal.text_primary,
+            font: fonts.body,
+            flags: DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        });
+        let hov_open = state.hovered == Some(ControlAction::OpenUserDictLocation);
+        draw_aa_rounded_rect(
+            pixels,
+            w,
+            h,
+            open_rc.left,
+            open_rc.top,
+            open_rc.right,
+            open_rc.bottom,
+            r_ctrl,
+            if hov_open { pal.btn_hover_bg } else { pal.btn_bg },
+            Some(pal.btn_border),
+        );
+        labels.push(PendingLabel {
+            text: "打开位置".to_owned(),
+            rc: open_rc,
+            color: pal.btn_fg,
+            font: fonts.small,
+            flags: DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        });
+        state.hit_regions.push(HitRegion {
+            rect: open_rc,
+            action: ControlAction::OpenUserDictLocation,
         });
     }
 
@@ -2506,6 +2560,15 @@ unsafe fn handle_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32) {
             state.config.learning_enabled = !state.config.learning_enabled;
             state.persist_and_push();
         }
+        ControlAction::OpenUserDictLocation => {
+            let ok = open_user_dict_location(&state.config_path);
+            state.status_note = if ok {
+                "已打开本地词库目录".to_owned()
+            } else {
+                "打开本地词库目录失败".to_owned()
+            };
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         ControlAction::ResetDefaults => {
             state.config = ImeConfig::default();
             state.persist_and_push();
@@ -2513,6 +2576,40 @@ unsafe fn handle_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32) {
         ControlAction::CloseWindow => {
             let _ = DestroyWindow(hwnd);
         }
+    }
+}
+
+fn default_user_dict_path(config_path: &PathBuf) -> PathBuf {
+    if let Some(dir) = config_path.parent() {
+        if !dir.as_os_str().is_empty() {
+            return dir.join("user_dict.tsv");
+        }
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        if !local_app_data.is_empty() {
+            return PathBuf::from(local_app_data)
+                .join("Pyn")
+                .join("user_dict.tsv");
+        }
+    }
+    PathBuf::from("user_dict.tsv")
+}
+
+fn open_user_dict_location(config_path: &PathBuf) -> bool {
+    let dict_path = default_user_dict_path(config_path);
+    let dir = dict_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&dir);
+
+    if dict_path.exists() {
+        Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{}\"", dict_path.display()))
+            .spawn()
+            .is_ok()
+    } else {
+        Command::new("explorer.exe").arg(&dir).spawn().is_ok()
     }
 }
 

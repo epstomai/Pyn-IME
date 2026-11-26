@@ -244,6 +244,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--no-model" => no_model = true,
             "--no-reranker" => no_reranker = true,
             "--no-learn" => no_learn = true,
+            "--cs-ai" => config.cs_ai_boost = true,
             "--score-candidates" => score_candidates = true,
             "--ctx" => {
                 ctx_arg = args.next().ok_or_else(|| "--ctx requires text".to_owned())?;

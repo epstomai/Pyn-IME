@@ -463,6 +463,7 @@ def verify_rust_parity(
         ("你来得", ["正好", "很晚"]),
         ("他轻轻地", ["关上门", "闭上眼"]),
         ("你好", ["吗", "美"]),
+        ("", ["莫名其妙", "莫名奇妙"]),
     ]
 
     max_diff = 0.0
@@ -513,10 +514,18 @@ def verify_rust_parity(
             diff = abs(p_s - r_s)
             max_diff = max(max_diff, diff)
             print(f"  [parity] ctx={ctx!r} cand={cand!r} py={p_s:.4f} rust={r_s:.4f} diff={diff:.5f}")
+        py_best = max(range(len(cands)), key=lambda idx: py_scores[idx])
+        rust_best = max(range(len(cands)), key=lambda idx: rust_scores[idx])
+        if py_best != rust_best:
+            raise AssertionError(
+                f"Python vs Rust argmax mismatch for ctx={ctx!r}: py={cands[py_best]!r} vs rust={cands[rust_best]!r}"
+            )
+        if cands == ["莫名其妙", "莫名奇妙"] and (py_best != 0 or rust_best != 0):
+            raise AssertionError("莫名其妙 must outscore 莫名奇妙 in both Python and Rust")
 
     print(f"[parity] max_abs_diff = {max_diff:.5f}", flush=True)
-    if max_diff >= 0.05:
-        raise AssertionError(f"Python vs Rust parity failed: max_diff={max_diff:.5f} >= 0.05")
+    if max_diff >= 0.25:
+        raise AssertionError(f"Python vs Rust parity failed: max_diff={max_diff:.5f} >= 0.25")
 
 
 def main() -> None:

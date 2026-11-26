@@ -589,6 +589,7 @@ mod tests {
             shift_toggle: false,
             initial_upper_english: false,
             learning_enabled: false,
+            cs_ai_boost: false,
         };
         let norm = raw.normalized();
         assert_eq!(norm.font_family, "MiSans");

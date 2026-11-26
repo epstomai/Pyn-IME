@@ -227,6 +227,7 @@ pub struct Model {
     multi_word_readings: Vec<(u32, u64, f32)>,
     mixed_lex: MixedLexTable,
     protected_fn_mask: Vec<u8>,
+    cs_ai_boost: Vec<f32>,
     user_oov_unigram_logp: f32,
 }
 
@@ -345,6 +346,16 @@ impl Model {
             }
         }
 
+        let mut cs_ai_boost = vec![0.0_f32; num_words];
+        for (word, boost) in crate::domain::cs_ai_entries() {
+            if let Some(id) = word_index.get(word, &word_offsets, &word_bytes) {
+                let idx = id as usize;
+                if idx < num_words && protected_fn_mask[idx] == 0 {
+                    cs_ai_boost[idx] = boost.clamp(0.0, 10.0);
+                }
+            }
+        }
+
         Self {
             word_offsets,
             word_bytes,
@@ -365,8 +376,18 @@ impl Model {
             multi_word_readings,
             mixed_lex,
             protected_fn_mask,
+            cs_ai_boost,
             user_oov_unigram_logp,
         }
+    }
+
+    #[inline]
+    pub fn cs_ai_boost(&self, word_id: u32) -> f32 {
+        self.cs_ai_boost.get(word_id as usize).copied().unwrap_or(0.0)
+    }
+
+    pub fn cs_ai_boost_count(&self) -> usize {
+        self.cs_ai_boost.iter().filter(|&&v| v > 0.0).count()
     }
 
     pub fn user_oov_unigram_logp(&self) -> f32 {

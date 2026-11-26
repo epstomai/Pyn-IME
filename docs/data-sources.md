@@ -6,10 +6,10 @@
 
 - **万象词库**：[amzxyz/rime-wanxiang](https://github.com/amzxyz/rime-wanxiang)（v18.2.0 Base 版）及 [amzxyz/rime-wanxiang-data](https://github.com/amzxyz/rime-wanxiang-data)，许可证 **CC BY 4.0**（要求署名与标明修改）。
   - 使用文件：`dicts/zi.dict.yaml`、`dicts/duoyin.dict.yaml`、`dicts/jichu.dict.yaml`、`dicts/diming.dict.yaml`、`dicts/mingren.dict.yaml`、`dicts/yiren.dict.yaml`。
-- **词表规范化与简体过滤（`jieba` + OpenCC `t2s`）**：[fxsjy/jieba](https://github.com/fxsjy/jieba) 默认词典 `dict.txt`（**MIT License**）配合 OpenCC `t2s` 简体化检验。
-  - 简体单字白名单：从 `zi.dict.yaml` 提取全部满足 `t2s(ch) == ch` 的纯汉字单字，共 `17,360` 字，剔除繁简异形干扰字（如 `麽`、`這`、`為`），确保评测集用字 `100%` 覆盖。
-  - 多字词过滤：从 `jieba` 提取长度 2–6 字、词频 $\ge 3$ 且 `t2s(word) == word` 的纯汉字词条，并剔除会吞噬句尾共现的粘连词条（以 `吗呢吧啊呀啦嘛哦噢呐哒` 结尾的多字词，以及长度 $\ge 3$ 且以 `了` 结尾的词），共导出 `295,302` 个规范词条；用于过滤万象基础词库与多音词库中的整句/短语碎片（保留全部简体单字、`jieba` 词条及权重 $\ge 1000$ 的地名/名人/艺人专名，第 2 期最终模型词表 `225,404` 词）。
-- **读音概率**：对同一词条的不同读音保留万象统计权重，计算拼音发射对数概率 `reading_logp`；标准 415 音节表剔除了独立鼻音 `hm/m/n/ng`。
+- **词表规范化、简体过滤与精选净化（`jieba` + OpenCC `t2s` + `data/curated/`）**：[fxsjy/jieba](https://github.com/fxsjy/jieba) 默认词典 `dict.txt`（**MIT License**）配合 OpenCC `t2s` 简体化检验，并在 `ime-v5` 接入 [curate_lexicon.py](../tools/train/curate_lexicon.py) 与仓库自建 `data/curated/` 四份独立审核数据表：
+  - 简体单字白名单：从 `zi.dict.yaml` 提取全部满足 `t2s(ch) == ch` 的纯汉字单字，共 `17,360` 字，剔除繁简异形干扰字（如 `麽`、`這`、`為`），并在 `ime-train` 导入 `zi.dict.yaml` 时额外过滤非简体常用异读 `著\tzhe`（仅保留 `zhù/zhuó`），确保评测集用字 `100%` 覆盖且不误出繁体异读。
+  - 多字词过滤与净化：从 `jieba` 提取长度 2–6 字、词频 $\ge 3$ 且 `t2s(word) == word` 的纯汉字词条，并剔除会吞噬句尾共现的粘连词条，得基础词表 `295,302` 词；再剔除 [typo_banlist.txt](../data/curated/typo_banlist.txt)（人工审核 `151` 条无歧义错别字词，实际从基础词表清除 `97` 词），合并 [modern_extra.tsv](../data/curated/modern_extra.tsv)（`555` 条现代高频词、品牌与 CS/AI 术语，手工核验音节与权重）及 [cs_ai_boost.tsv](../data/curated/cs_ai_boost.tsv) 词条（`312` 条纯 CS/AI 术语），导出 `lexicon_words_v2.txt`（`295,670` 词）。训练时经 `--ban-words` 与 `--extra-dict`（保护精选多音词不因词表截断丢失，保留简体单字、`jieba` 词条及权重 $\ge 1000$ 的地名/名人/艺人专名），产出第 5 期模型词表 `225,812` 词。
+- **读音概率与可选领域先验**：对同一词条的不同读音保留万象统计权重与 `--extra-dict` 校准权重，计算拼音发射对数概率 `reading_logp`；标准 415 音节表剔除了独立鼻音 `hm/m/n/ng`。仅当用户显式开启 `--cs-ai` 或设置界面的「CS / AI 术语优先」开关时，解码器才加载 [cs_ai_boost.tsv](../data/curated/cs_ai_boost.tsv) 的受控对数先验加成（仅作用于无简拼多字词，默认关闭）。
 
 ## 2. 训练语料
 
@@ -36,10 +36,11 @@
 ### 2.4 第 3 期神经重排训练语料（Causal Character LM）
 - **脚本与配方**：[train_reranker.py](../tools/train/train_reranker.py)（Stage-1）与 [finetune_reranker_s2.py](../tools/train/finetune_reranker_s2.py)（Stage-2），与第 2 期共用同一份 1,689 条评测黑名单并核验 `extra_leaked = 0`。
 - **字符词表与 Stage-1 预训练**：从上述三份简体清洗语料（`11,370,832` 行、`2.21 亿` 汉字）统计前 `6,144` 词表（涵盖常用汉字与标点，`99.9907%` 汉字覆盖率），切分为 `train_tokens.u16`（`255,120,535` token）与 `val_tokens.u16`（`899,204` token），完成 `23,356` 步自归一化 Causal Character Transformer 预训练。
-- **Stage-2 纯书面与的/得/地对比微调**：针对微博 LCCC 中大量「努力的/说的对/你好美」噪音会稀释虚词与的/得/地边界的问题，Stage-2 剔除 LCCC，仅保留 FineWeb-2 纯书面分片（`9,183,252` 行、`fw_train=230,227,486` token、`fw_val=750,855` token），并从中抽取 **`177,826` 条**独立「的/得/地」文法三元组（`的=60,000`、`得=57,826`、`地=60,000`；`174,826` 训练 / `3,000` 验证）联合训练 `3,000` 步，验证集三元组准确率从 `75.07%` 升至 **`94.57%`**（`的 96.0% / 得 93.5% / 地 94.2%`）。
+- **Stage-2 纯书面与错字/语法对比微调**：针对微博 LCCC 中大量「努力的/说的对/你好美」噪音会稀释虚词与的/得/地边界的问题，Stage-2 剔除 LCCC，仅保留 FineWeb-2 纯书面分片（`9,183,252` 行、`fw_train=230,227,486` token、`fw_val=750,855` token），从中抽取 **`177,826` 条**独立「的/得/地」文法三元组（`的=60,000`、`得=57,826`、`地=60,000`；`174,826` 训练 / `3,000` 验证），并在 `ime-v5` 进一步接入 [confusable_pairs.tsv](../data/curated/confusable_pairs.tsv)（**`166` 组 / `201` 对**严格无歧义同音错字与成语误写最小对）：在过滤评测黑名单后从 FineWeb-2 匹配出 `9,056` 条含目标词的真实书面语境句（覆盖 `152/166` 组）并与 `6×` 独立短语一起组成 `8,930` 条对比训练样本（验证集 `val_ctx=1,332`、`val_standalone=201`），按与线上一致的 `eos_weight=0.85`、`pair_weight=0.35`、`pair_margin=1.5` 联合微调 `2,000` 步，最终 `de_val_acc` 保持 **`94.70%`**，`pair_ctx` 由 `96.85%` 升至 **`99.92%`**、`pair_sa` 由 `83.58%` 升至 **`100.00%`**。
 
 ## 3. 零泄漏原则与评测隔离
 
 - `eval/sets/general.jsonl` 取自 [Tatoeba](https://tatoeba.org)（CC BY 2.0 FR），**仅用于评测，严禁进入任何训练或调参语料**。
+- `eval/sets/modern_orthography.jsonl`（`94` 条：覆盖现代高频词汇、常见成语正字法纠错与高冲突 CS/AI 术语对比）同样纳入零泄漏精确黑名单检查，并在训练前验证与所有 `eval/sets/*.jsonl` 训练语料零重叠。
 - 从 `eval/sets/*.jsonl` 提取所有长度 $\ge 8$ 汉字的 `expected` 分句（共 `1,689` 条）作为精确防泄漏黑名单；仅当清洗后的整句或句内长分句精确等于其中任一条时整句丢弃（避免把「我们可以」「新年快乐」「这是我的」等 4–7 字高频日常短语误删成训练空洞）。
 - 模型训练产出 `models/ime_model.bin` 与 `models/reranker.bin` 已加入 `.gitignore`，不直接提交至代码仓库；用户语料与临时文件保留在 `.external/` 下。

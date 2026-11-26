@@ -57,7 +57,7 @@ const CLASS_NAME: &str = "PynSettingsWnd";
 const WINDOW_TITLE: &str = "Pyn 设置";
 const MUTEX_NAME: &str = r"Local\PynSettingsMutex_v1";
 const LOGICAL_W: i32 = 580;
-const LOGICAL_H: i32 = 780;
+const LOGICAL_H: i32 = 812;
 
 const CURATED_CJK_FONTS: &[&str] = &[
     "MiSans",
@@ -425,6 +425,7 @@ enum ControlAction {
     ToggleCaret,
     ToggleToast,
     ToggleLearning,
+    ToggleCsAiBoost,
     OpenUserDictLocation,
     ResetDefaults,
     CloseWindow,
@@ -1269,6 +1270,7 @@ unsafe fn render_settings_surface(
         ("显示拼音输入光标", state.config.show_preedit_caret, ControlAction::ToggleCaret),
         ("切换模式时显示状态浮标", state.config.show_mode_toast, ControlAction::ToggleToast),
         ("启用本地词频自学习", state.config.learning_enabled, ControlAction::ToggleLearning),
+        ("CS / AI 术语优先", state.config.cs_ai_boost, ControlAction::ToggleCsAiBoost),
     ];
     let t_row_h = px(32);
     let dict_row_h = px(34);
@@ -2558,6 +2560,10 @@ unsafe fn handle_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32) {
         }
         ControlAction::ToggleLearning => {
             state.config.learning_enabled = !state.config.learning_enabled;
+            state.persist_and_push();
+        }
+        ControlAction::ToggleCsAiBoost => {
+            state.config.cs_ai_boost = !state.config.cs_ai_boost;
             state.persist_and_push();
         }
         ControlAction::OpenUserDictLocation => {

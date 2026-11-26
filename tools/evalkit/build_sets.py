@@ -47,6 +47,7 @@ ID_PREFIX = {
     "abbrev": "abr",
     "precedence": "pre",
     "general": "gen",
+    "modern_orthography": "mod",
 }
 
 
@@ -378,6 +379,9 @@ def main() -> None:
         "abbrev": abbrev,
         "precedence": build_precedence(SRC / "precedence_words.txt"),
     }
+    modern_src = SRC / "modern_orthography.txt"
+    if modern_src.exists():
+        suites["modern_orthography"] = load_hand_cases(modern_src)
     if args.tatoeba:
         suites["general"] = build_general(args.tatoeba)
     for name in ("incremental", "precedence", "general"):

@@ -52,6 +52,7 @@ pub struct ImeConfig {
     pub shift_toggle: bool,
     pub initial_upper_english: bool,
     pub learning_enabled: bool,
+    pub cs_ai_boost: bool,
 }
 
 impl Default for ImeConfig {
@@ -70,6 +71,7 @@ impl Default for ImeConfig {
             shift_toggle: true,
             initial_upper_english: true,
             learning_enabled: true,
+            cs_ai_boost: false,
         }
     }
 }
@@ -130,5 +132,19 @@ impl ImeConfig {
             )
         }
         .map_err(|e| io::Error::from_raw_os_error(e.code().0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_without_cs_ai_boost_defaults_to_false() {
+        let legacy = r#"{"theme":"auto","layout":"horizontal","page_size":5,"learning_enabled":true}"#;
+        let parsed = serde_json::from_str::<ImeConfig>(legacy).unwrap().normalized();
+        assert!(!parsed.cs_ai_boost);
+        assert!(parsed.learning_enabled);
+        assert_eq!(parsed.page_size, 5);
     }
 }

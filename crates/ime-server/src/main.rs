@@ -279,6 +279,8 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                     }
                 }
             };
+            let mut dcfg = ctx.decoder_cfg;
+            dcfg.cs_ai_boost = st.config.cs_ai_boost;
             let outcome = decode_with_user(
                 &ctx.model,
                 ctx.reranker.as_deref(),
@@ -286,7 +288,7 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                 &keys,
                 &context,
                 limit,
-                &ctx.decoder_cfg,
+                &dcfg,
             );
             let sess = st.touch_session(session_id);
             sess.last_keys = keys;
@@ -322,6 +324,8 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                 }
             };
             let (base_top1, cur_top1) = if base_top1.is_none() && !keys.is_empty() {
+                let mut dcfg = ctx.decoder_cfg;
+                dcfg.cs_ai_boost = st.config.cs_ai_boost;
                 let outcome = decode_with_user(
                     &ctx.model,
                     ctx.reranker.as_deref(),
@@ -329,7 +333,7 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                     &keys,
                     &context,
                     10,
-                    &ctx.decoder_cfg,
+                    &dcfg,
                 );
                 (outcome.base_top1, outcome.candidates.first().cloned())
             } else {

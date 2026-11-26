@@ -4,6 +4,7 @@
 //! reset, set context, convert, commit, and undo.
 
 pub mod decoder;
+pub mod domain;
 pub mod model;
 pub mod pinyin;
 pub mod reranker;
@@ -874,5 +875,124 @@ mod tests {
             keys: None,
         }]);
         assert_eq!(engine2.convert("ypan", 5).first().map(String::as_str), Some("硬盘"));
+    }
+
+    #[test]
+    fn cs_ai_domain_boost_toggles_without_touching_general_or_function_words() {
+        let words = [
+            "<bos>", "<eos>", "<pause>", "这", "是", "我", "的", "携", "程", "协", "携程", "协程",
+        ];
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        let mut word_bytes = Vec::new();
+        for w in &words {
+            word_offsets.push(word_bytes.len() as u32);
+            word_bytes.extend_from_slice(w.as_bytes());
+        }
+        word_offsets.push(word_bytes.len() as u32);
+
+        let n = words.len();
+        let mut unigram_logp = vec![-8.0_f32; n];
+        unigram_logp[EOS_ID as usize] = -2.0;
+        unigram_logp[3] = -2.5; // 这
+        unigram_logp[4] = -2.0; // 是
+        unigram_logp[5] = -2.2; // 我
+        unigram_logp[6] = -1.5; // 的
+        unigram_logp[10] = -2.0; // 携程 (higher general prior)
+        unigram_logp[11] = -3.4; // 协程 (lower general prior)
+        let unigram_bow = vec![-0.2_f32; n];
+
+        let zhe = syllable_id("zhe").unwrap();
+        let shi = syllable_id("shi").unwrap();
+        let wo = syllable_id("wo").unwrap();
+        let de = syllable_id("de").unwrap();
+        let xie = syllable_id("xie").unwrap();
+        let cheng = syllable_id("cheng").unwrap();
+
+        let exact = build_lex_table(
+            vec![
+                (pack_exact(&[zhe]).unwrap(), LexEntry { word_id: 3, reading_logp: 0.0 }),
+                (pack_exact(&[shi]).unwrap(), LexEntry { word_id: 4, reading_logp: 0.0 }),
+                (pack_exact(&[wo]).unwrap(), LexEntry { word_id: 5, reading_logp: 0.0 }),
+                (pack_exact(&[de]).unwrap(), LexEntry { word_id: 6, reading_logp: 0.0 }),
+                (pack_exact(&[xie]).unwrap(), LexEntry { word_id: 7, reading_logp: 0.0 }),
+                (pack_exact(&[cheng]).unwrap(), LexEntry { word_id: 8, reading_logp: 0.0 }),
+                (pack_exact(&[xie]).unwrap(), LexEntry { word_id: 9, reading_logp: 0.0 }),
+                (pack_exact(&[xie, cheng]).unwrap(), LexEntry { word_id: 10, reading_logp: 0.0 }),
+                (pack_exact(&[xie, cheng]).unwrap(), LexEntry { word_id: 11, reading_logp: 0.0 }),
+            ]
+            .into_iter(),
+        );
+        let initial_chars: [Vec<LexEntry>; 26] = std::array::from_fn(|_| Vec::new());
+        let empty_lex = LexTable::default();
+        let mut bigram_offsets = vec![0u32; n + 1];
+        let mut bigram_w2 = Vec::new();
+        let mut bigram_logp = Vec::new();
+        let mut bigram_bow = Vec::new();
+        for w1 in 0..n {
+            bigram_offsets[w1] = bigram_w2.len() as u32;
+            match w1 {
+                0 => {
+                    bigram_w2.extend_from_slice(&[3, 10, 11]);
+                    bigram_logp.extend_from_slice(&[-1.5, -1.8, -3.2]);
+                    bigram_bow.extend_from_slice(&[-0.1; 3]);
+                }
+                3 => {
+                    bigram_w2.push(4);
+                    bigram_logp.push(-1.2);
+                    bigram_bow.push(-0.1);
+                }
+                4 => {
+                    bigram_w2.push(5);
+                    bigram_logp.push(-1.2);
+                    bigram_bow.push(-0.1);
+                }
+                5 => {
+                    bigram_w2.push(6);
+                    bigram_logp.push(-1.0);
+                    bigram_bow.push(-0.1);
+                }
+                6 | 10 | 11 => {
+                    bigram_w2.push(EOS_ID);
+                    bigram_logp.push(-0.2);
+                    bigram_bow.push(-0.1);
+                }
+                _ => {}
+            }
+        }
+        bigram_offsets[n] = bigram_w2.len() as u32;
+        let trigram_offsets = vec![0u32; bigram_w2.len() + 1];
+
+        let model = Arc::new(Model::from_parts(
+            word_offsets,
+            word_bytes,
+            unigram_logp,
+            unigram_bow,
+            exact,
+            initial_chars,
+            empty_lex.clone(),
+            empty_lex,
+            bigram_offsets,
+            bigram_w2,
+            bigram_logp,
+            bigram_bow,
+            trigram_offsets,
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert!(model.cs_ai_boost_count() >= 1);
+        assert_eq!(model.cs_ai_boost(6), 0.0);
+        assert!(model.cs_ai_boost(11) >= 2.0);
+
+        let mut engine = Engine::with_model(model);
+        // Default: general prior wins.
+        assert_eq!(engine.convert("xiecheng", 5).first().map(String::as_str), Some("携程"));
+        assert_eq!(engine.convert("zheshiwode", 5).first().map(String::as_str), Some("这是我的"));
+
+        // Enabled CS/AI boost: domain term wins without disturbing general function words.
+        let mut cfg = DecoderConfig::default();
+        cfg.cs_ai_boost = true;
+        engine.set_config(cfg);
+        assert_eq!(engine.convert("xiecheng", 5).first().map(String::as_str), Some("协程"));
+        assert_eq!(engine.convert("zheshiwode", 5).first().map(String::as_str), Some("这是我的"));
     }
 }

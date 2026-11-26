@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SETS = ROOT / "eval" / "sets"
 REPORTS = ROOT / "eval" / "reports"
 EXTERNAL = ROOT / ".external"
-CASE_SUITES = ["function_words", "incremental", "abbrev", "precedence", "de_grammar", "general"]
+DEFAULT_SUITES = ["function_words", "incremental", "abbrev", "precedence", "de_grammar", "general"]
+CASE_SUITES = DEFAULT_SUITES + ["modern_orthography"]
 NBEST = 10
 RIME_DIRS = {"rime-plain": "rime_plain", "rime-gram": "rime_gram", "rime-gram-ctx": "rime_gram_ctx"}
 
@@ -232,7 +233,7 @@ def main() -> None:
     parser.add_argument("--engine", required=True)
     parser.add_argument("--cmd")
     parser.add_argument("--name")
-    parser.add_argument("--suites", nargs="*", default=CASE_SUITES + ["pollution"])
+    parser.add_argument("--suites", nargs="*", default=DEFAULT_SUITES + ["pollution"])
     parser.add_argument("--limit", type=int, help="first N cases per suite (smoke runs)")
     parser.add_argument("--no-report", action="store_true")
     args = parser.parse_args()

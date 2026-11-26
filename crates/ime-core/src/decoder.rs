@@ -26,6 +26,7 @@ pub struct DecoderConfig {
     pub rerank_top_k: usize,
     pub fuzzy_enabled: bool,
     pub typo_correction_enabled: bool,
+    pub cs_ai_boost: bool,
 }
 
 impl Default for DecoderConfig {
@@ -46,6 +47,7 @@ impl Default for DecoderConfig {
             rerank_top_k: 10,
             fuzzy_enabled: false,
             typo_correction_enabled: false,
+            cs_ai_boost: false,
         }
     }
 }
@@ -70,6 +72,7 @@ struct SpanEdge {
     abbrev_count: u8,
     pron: SpanPron,
     user_boost: f32,
+    domain_boost: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -275,6 +278,7 @@ pub fn decode_with_user(
                     }
                     if !prev_hyps.is_empty() {
                         let local_acoustic = cfg.reading_weight * span.reading_logp
+                            + span.domain_boost
                             - cfg.word_penalty
                             - (span.abbrev_count as f32) * cfg.abbrev_penalty;
                         let word_uni = model
@@ -333,7 +337,13 @@ pub fn decode_with_user(
                                     let lm_score =
                                         model.trigram_logp(tail.pre_h1, tail.pre_h2, joined_id)
                                             - tail.tail_lm_score;
+                                    let joined_domain = if cfg.cs_ai_boost && span.abbrev_count == 0 {
+                                        model.cs_ai_boost(joined_id)
+                                    } else {
+                                        0.0
+                                    };
                                     let acoustic_score = cfg.reading_weight * joined_rp
+                                        + joined_domain
                                         - cfg.word_penalty
                                         - (span.abbrev_count as f32) * cfg.abbrev_penalty;
                                     raw.push(RawHyp {
@@ -747,6 +757,7 @@ fn collect_spans(
                                 edge.end,
                                 0,
                                 SpanPron::Exact { len: 1, syls: one },
+                                cfg.cs_ai_boost,
                                 &mut spans_to[edge.end],
                             );
                         }
@@ -767,6 +778,7 @@ fn collect_spans(
                                 len: 1,
                                 letters: one,
                             },
+                            cfg.cs_ai_boost,
                             &mut spans_to[edge.end],
                         );
                     }
@@ -816,6 +828,7 @@ fn collect_spans(
                         edge.end,
                         0,
                         pron,
+                        cfg.cs_ai_boost,
                         &mut spans_to[edge.end],
                     );
                     for m in &user_matches {
@@ -829,6 +842,7 @@ fn collect_spans(
                                 abbrev_count: 0,
                                 pron,
                                 user_boost: m.boost,
+                                domain_boost: 0.0,
                             });
                         }
                     }
@@ -871,6 +885,7 @@ fn collect_spans(
                             len: next_len as u8,
                             letters,
                         },
+                        cfg.cs_ai_boost,
                         &mut spans_to[edge.end],
                     );
                 }
@@ -914,6 +929,7 @@ fn collect_spans(
                                 prefix,
                                 last_letter: letter,
                             },
+                            cfg.cs_ai_boost,
                             &mut spans_to[edge.end],
                         );
                     }
@@ -949,6 +965,7 @@ fn collect_spans(
                         len: next_len as u8,
                         units: next_units,
                     },
+                    cfg.cs_ai_boost,
                     &mut spans_to[edge.end],
                 );
                 if next_len < MAX_MIXED_LEN {
@@ -1003,6 +1020,7 @@ fn push_spans(
     end: usize,
     abbrev_count: u8,
     pron: SpanPron,
+    cs_ai_boost_enabled: bool,
     out: &mut Vec<SpanEdge>,
 ) {
     if entries.is_empty() {
@@ -1016,6 +1034,13 @@ fn push_spans(
         }
         0.0
     };
+    let domain_for = |word_id: u32| -> f32 {
+        if cs_ai_boost_enabled && abbrev_count == 0 {
+            model.cs_ai_boost(word_id)
+        } else {
+            0.0
+        }
+    };
     let head = max_keep.min(entries.len());
     for e in &entries[..head] {
         out.push(SpanEdge {
@@ -1025,14 +1050,16 @@ fn push_spans(
             abbrev_count,
             pron,
             user_boost: boost_for(e.word_id),
+            domain_boost: domain_for(e.word_id),
         });
     }
     let check_fn = end - start <= 6;
-    if check_fn || !user_matches.is_empty() {
+    if check_fn || !user_matches.is_empty() || (cs_ai_boost_enabled && abbrev_count == 0) {
         for e in &entries[head..] {
             let user_boost = boost_for(e.word_id);
+            let domain_boost = domain_for(e.word_id);
             let is_prot_fn = check_fn && model.is_protected_function_word(e.word_id);
-            if user_boost > 0.0 || is_prot_fn {
+            if user_boost > 0.0 || is_prot_fn || domain_boost > 0.0 {
                 out.push(SpanEdge {
                     start,
                     word: SpanWord::Model(e.word_id),
@@ -1040,6 +1067,7 @@ fn push_spans(
                     abbrev_count,
                     pron,
                     user_boost,
+                    domain_boost,
                 });
             }
         }

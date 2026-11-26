@@ -1,0 +1,562 @@
+# 现代高频词与 CS / AI / 系统开发精选补充表
+# 格式: word<TAB>space_separated_toneless_pinyin<TAB>weight
+# 严格校验: 2-6 简体汉字, ü 写作 v, 权重对齐 wanxiang_jichu (1200..=35000)
+
+# === 现代日常 / 互联网 / 品牌 / 生活词 ===
+大模型	da mo xing	12000
+深度学习	shen du xue xi	18000
+机器学习	ji qi xue xi	28000
+人工智能	ren gong zhi neng	22000
+原神	yuan shen	14000
+星穹铁道	xing qiong tie dao	4000
+黑神话	hei shen hua	4000
+王者荣耀	wang zhe rong yao	12000
+和平精英	he ping jing ying	6000
+米哈游	mi ha you	5000
+知乎	zhi hu	30000
+微信	wei xin	35000
+抖音	dou yin	25000
+小红书	xiao hong shu	15000
+拼多多	pin duo duo	18000
+哔哩哔哩	bi li bi li	12000
+网易云	wang yi yun	8000
+美团	mei tuan	18000
+饿了么	e le me	8000
+高德	gao de	8000
+闲鱼	xian yu	8000
+得物	de wu	5000
+公众号	gong zhong hao	20000
+朋友圈	peng you quan	18000
+小程序	xiao cheng xu	15000
+视频号	shi pin hao	10000
+评论区	ping lun qu	16000
+热搜	re sou	12000
+词条	ci tiao	6000
+弹幕	dan mu	10000
+点赞	dian zan	18000
+吐槽	tu cao	16000
+靠谱	kao pu	16000
+人设	ren she	10000
+颜值	yan zhi	12000
+刷题	shua ti	12000
+网课	wang ke	12000
+校招	xiao zhao	8000
+社招	she zhao	6000
+内推	nei tui	6000
+入职	ru zhi	12000
+离职	li zhi	12000
+摸鱼	mo yu	8000
+内卷	nei juan	10000
+躺平	tang ping	10000
+破防	po fang	8000
+种草	zhong cao	8000
+拔草	ba cao	5000
+博主	bo zhu	10000
+主播	zhu bo	14000
+自媒体	zi mei ti	12000
+背锅	bei guo	6000
+背刺	bei ci	4000
+霸凌	ba ling	6000
+标题党	biao ti dang	5000
+五险一金	wu xian yi jin	8000
+充电宝	chong dian bao	8000
+蓝牙耳机	lan ya er ji	6000
+降噪耳机	jiang zao er ji	5000
+机械键盘	ji xie jian pan	6000
+固态硬盘	gu tai ying pan	6000
+内存条	nei cun tiao	5000
+高刷	gao shua	3000
+手游	shou you	12000
+端游	duan you	6000
+二次元	er ci yuan	10000
+手办	shou ban	6000
+漫展	man zhan	5000
+番剧	fan ju	6000
+轻小说	qing xiao shuo	5000
+网文	wang wen	6000
+盲盒	mang he	6000
+潮玩	chao wan	4000
+露营	lu ying	6000
+飞盘	fei pan	4000
+剧本杀	ju ben sha	6000
+密室逃脱	mi shi tao tuo	5000
+脱口秀	tuo kou xiu	8000
+播客	bo ke	5000
+折叠屏	zhe die ping	5000
+智能手表	zhi neng shou biao	6000
+扫地机器人	sao di ji qi ren	5000
+空气炸锅	kong qi zha guo	5000
+破壁机	po bi ji	4000
+轻食	qing shi	4000
+减脂餐	jian zhi can	4000
+普拉提	pu la ti	4000
+卷腹	juan fu	4000
+撸铁	lu tie	4000
+增肌	zeng ji	5000
+减脂	jian zhi	6000
+体脂率	ti zhi lv	5000
+基础代谢	ji chu dai xie	5000
+新能源汽车	xin neng yuan qi che	10000
+自动驾驶	zi dong jia shi	10000
+智能驾驶	zhi neng jia shi	8000
+鸿蒙	hong meng	10000
+安卓	an zhuo	14000
+英伟达	ying wei da	10000
+特斯拉	te si la	14000
+宁德时代	ning de shi dai	8000
+产品经理	chan pin jing li	14000
+基金经理	ji jin jing li	8000
+网约车	wang yue che	8000
+快递柜	kuai di gui	5000
+共享单车	gong xiang dan che	8000
+正能量	zheng neng liang	10000
+题主	ti zhu	10000
+官网	guan wang	14000
+线上	xian shang	15000
+线下	xian xia	15000
+男主	nan zhu	10000
+女主	nv zhu	10000
+小白	xiao bai	10000
+大牛	da niu	8000
+学霸	xue ba	10000
+保研	bao yan	8000
+跨考	kua kao	4000
+日活	ri huo	4000
+月活	yue huo	4000
+留存率	liu cun lv	4000
+转化率	zhuan hua lv	6000
+复购率	fu gou lv	4000
+客单价	ke dan jia	4000
+直播间	zhi bo jian	10000
+带货	dai huo	8000
+拼团	pin tuan	4000
+秒杀	miao sha	8000
+核销	he xiao	4000
+充电桩	chong dian zhuang	6000
+换电站	huan dian zhan	4000
+光刻机	guang ke ji	6000
+算力	suan li	10000
+智算	zhi suan	3000
+低空经济	di kong jing ji	4000
+具身智能	ju shen zhi neng	4000
+人形机器人	ren xing ji qi ren	6000
+空间计算	kong jian ji suan	3000
+混合现实	hun he xian shi	4000
+脑机接口	nao ji jie kou	5000
+量子计算	liang zi ji suan	6000
+元宇宙	yuan yu zhou	8000
+区块链	qu kuai lian	10000
+云计算	yun ji suan	12000
+大数据	da shu ju	18000
+物联网	wu lian wang	12000
+数字孪生	shu zi luan sheng	4000
+智慧城市	zhi hui cheng shi	6000
+运存	yun cun	3000
+触控	chu kong	5000
+扫码	sao ma	10000
+二维码	er wei ma	14000
+打卡	da ka	12000
+避坑	bi keng	6000
+干货	gan huo	8000
+踩坑	cai keng	6000
+复盘	fu pan	8000
+对齐	dui qi	8000
+赋能	fu neng	5000
+抓手	zhua shou	5000
+闭环	bi huan	6000
+颗粒度	ke li du	4000
+心智	xin zhi	6000
+赛道	sai dao	8000
+破圈	po quan	5000
+出圈	chu quan	6000
+内耗	nei hao	8000
+情绪价值	qing xu jia zhi	6000
+松弛感	song chi gan	6000
+性价比	xing jia bi	16000
+质价比	zhi jia bi	3000
+平替	ping ti	6000
+国潮	guo chao	5000
+比亚迪	bi ya di	12000
+华为	hua wei	20000
+小米	xiao mi	18000
+阿里巴巴	a li ba ba	12000
+字节跳动	zi jie tiao dong	10000
+腾讯	teng xun	18000
+百度	bai du	18000
+京东	jing dong	16000
+顺丰	shun feng	12000
+滴滴	di di	14000
+支付宝	zhi fu bao	18000
+淘宝	tao bao	20000
+微博	wei bo	24000
+豆瓣	dou ban	14000
+知网	zhi wang	10000
+开源	kai yuan	12000
+闭源	bi yuan	5000
+真题	zhen ti	10000
+谷歌	gu ge	12000
+食材	shi cai	10000
+比特币	bi te bi	10000
+烤肠	kao chang	6000
+定投	ding tou	6000
+网红	wang hong	12000
+思维导图	si wei dao tu	8000
+重疾险	zhong ji xian	6000
+解锁	jie suo	10000
+入坑	ru keng	6000
+专硕	zhuan shuo	6000
+短视频	duan shi pin	12000
+钢铁侠	gang tie xia	8000
+美股	mei gu	8000
+猫咪	mao mi	10000
+双十一	shuang shi yi	8000
+零基础	ling ji chu	6000
+副驾	fu jia	6000
+漫威	man wei	8000
+宝可梦	bao ke meng	8000
+氪金	ke jin	6000
+闺蜜	gui mi	10000
+泪目	lei mu	6000
+领英	ling ying	6000
+脑洞	nao dong	8000
+实操	shi cao	6000
+爱奇艺	ai qi yi	10000
+剧透	ju tou	8000
+单曲	dan qu	8000
+风控	feng kong	8000
+打脸	da lian	6000
+差评	cha ping	8000
+爆款	bao kuan	8000
+移动端	yi dong duan	8000
+脑补	nao bu	6000
+单品	dan pin	6000
+数据集	shu ju ji	10000
+美剧	mei ju	8000
+下架	xia jia	8000
+翻唱	fan chang	8000
+新冠	xin guan	10000
+众筹	zhong chou	6000
+秋招	qiu zhao	8000
+深蹲	shen dun	6000
+优酷	you ku	8000
+绘本	hui ben	6000
+网盘	wang pan	8000
+话术	hua shu	6000
+逆袭	ni xi	8000
+掌机	zhang ji	6000
+白嫖	bai piao	5000
+考公	kao gong	8000
+萌新	meng xin	6000
+码农	ma nong	8000
+执念	zhi nian	6000
+包邮	bao you	8000
+微单	wei dan	6000
+阿里云	a li yun	8000
+硬拉	ying la	5000
+分镜	fen jing	5000
+网购	wang gou	10000
+
+# === CS / AI / 系统与开发术语 ===
+算子融合	suan zi rong he	3500
+推测解码	tui ce jie ma	3500
+投机采样	tou ji cai yang	3000
+前缀树	qian zhui shu	3500
+字典树	zi dian shu	3500
+双数组字典树	shuang shu zu zi dian shu	3000
+幂等性	mi deng xing	3500
+幂等	mi deng	3000
+零拷贝	ling kao bei	3500
+反向传播	fan xiang chuan bo	4500
+前向传播	qian xiang chuan bo	3500
+分页注意力	fen ye zhu yi li	3000
+注意力机制	zhu yi li ji zhi	4500
+自注意力	zi zhu yi li	3500
+多头注意力	duo tou zhu yi li	3500
+交叉注意力	jiao cha zhu yi li	2500
+稀疏注意力	xi shu zhu yi li	2500
+键值缓存	jian zhi huan cun	3500
+词嵌入	ci qian ru	3000
+词向量	ci xiang liang	4000
+词元	ci yuan	3000
+词表	ci biao	3500
+分词器	fen ci qi	3500
+位置编码	wei zhi bian ma	3500
+旋转位置编码	xuan zhuan wei zhi bian ma	3000
+残差连接	can cha lian jie	3500
+层归一化	ceng gui yi hua	3500
+批量归一化	pi liang gui yi hua	3000
+均方根归一化	jun fang gen gui yi hua	2500
+激活函数	ji huo han shu	4500
+损失函数	sun shi han shu	4500
+交叉熵	jiao cha shang	4000
+困惑度	kun huo du	3000
+点互信息	dian hu xin xi	3000
+余弦相似度	yu xian xiang si du	3500
+束搜索	shu sou suo	3000
+贪心解码	tan xin jie ma	2500
+核采样	he cai yang	2500
+温度采样	wen du cai yang	2500
+梯度下降	ti du xia jiang	4500
+梯度裁剪	ti du cai jian	2500
+梯度累积	ti du lei ji	2500
+梯度消失	ti du xiao shi	3000
+梯度爆炸	ti du bao zha	3000
+学习率	xue xi lv	4500
+余弦退火	yu xian tui huo	2500
+权重衰减	quan zhong shuai jian	3000
+过拟合	guo ni he	4500
+欠拟合	qian ni he	3500
+正则化	zheng ze hua	4500
+早停	zao ting	2500
+混合精度	hun he jing du	3500
+半精度	ban jing du	3000
+单精度	dan jing du	3500
+双精度	shuang jing du	3500
+模型量化	mo xing liang hua	3500
+权重量化	quan zhong liang hua	2500
+激活量化	ji huo liang hua	2500
+知识蒸馏	zhi shi zheng liu	3500
+模型剪枝	mo xing jian zhi	3000
+低秩适配	di zhi shi pei	3000
+监督微调	jian du wei tiao	3000
+指令微调	zhi ling wei tiao	3500
+全量微调	quan liang wei tiao	3000
+高效微调	gao xiao wei tiao	2500
+强化学习	qiang hua xue xi	6000
+偏好对齐	pian hao dui qi	2500
+思维链	si wei lian	4000
+提示词	ti shi ci	6000
+系统提示词	xi tong ti shi ci	3500
+上下文窗口	shang xia wen chuang kou	3500
+长上下文	chang shang xia wen	3500
+检索增强	jian suo zeng qiang	3500
+向量库	xiang liang ku	3500
+向量数据库	xiang liang shu ju ku	4000
+向量检索	xiang liang jian suo	3500
+多模态	duo mo tai	5000
+智能体	zhi neng ti	6000
+基座模型	ji zuo mo xing	4000
+开源模型	kai yuan mo xing	4000
+闭源模型	bi yuan mo xing	3500
+推理模型	tui li mo xing	3500
+端侧模型	duan ce mo xing	3000
+扩散模型	kuo san mo xing	4000
+专家混合	zhuan jia hun he	3000
+稀疏激活	xi shu ji huo	2500
+张量并行	zhang liang bing xing	3000
+流水线并行	liu shui xian bing xing	3000
+数据并行	shu ju bing xing	3000
+序列并行	xu lie bing xing	2500
+专家并行	zhuan jia bing xing	2500
+连续批处理	lian xu pi chu li	2500
+动态批处理	dong tai pi chu li	2500
+算子	suan zi	3500
+张量	zhang liang	4000
+矩阵乘法	ju zhen cheng fa	4000
+广播机制	guang bo ji zhi	2500
+自动微分	zi dong wei fen	3000
+计算图	ji suan tu	3500
+静态图	jing tai tu	3000
+动态图	dong tai tu	3000
+显存	xian cun	6000
+显存占用	xian cun zhan yong	3500
+显存溢出	xian cun yi chu	3000
+内存泄漏	nei cun xie lou	4000
+内存溢出	nei cun yi chu	3500
+内存对齐	nei cun dui qi	3000
+内存屏障	nei cun ping zhang	3000
+内存池	nei cun chi	3500
+线程池	xian cheng chi	4500
+连接池	lian jie chi	4000
+协程	xie cheng	3500
+协程调度	xie cheng diao du	2500
+闭包	bi bao	4000
+泛型	fan xing	3500
+借用检查	jie yong jian cha	3000
+模式匹配	mo shi pi pei	4000
+特征对象	te zheng dui xiang	2500
+宏展开	hong zhan kai	2500
+结构体	jie gou ti	4500
+智能指针	zhi neng zhi zhen	4000
+空指针	kong zhi zhen	4000
+野指针	ye zhi zhen	3500
+悬垂指针	xuan chui zhi zhen	2500
+栈帧	zhan zhen	3000
+调用栈	diao yong zhan	3500
+堆内存	dui nei cun	3500
+栈内存	zhan nei cun	3500
+哈希表	ha xi biao	4500
+红黑树	hong hei shu	4500
+平衡树	ping heng shu	3500
+二叉搜索树	er cha sou suo shu	3500
+线段树	xian duan shu	3500
+树状数组	shu zhuang shu zu	3000
+并查集	bing cha ji	3500
+优先队列	you xian dui lie	4000
+双端队列	shuang duan dui lie	3500
+单调栈	dan diao zhan	3000
+单调队列	dan diao dui lie	3000
+无锁队列	wu suo dui lie	3000
+环形缓冲区	huan xing huan chong qu	2500
+跳表	tiao biao	3500
+布隆过滤器	bu long guo lv qi	3500
+强连通	qiang lian tong	3000
+强连通分量	qiang lian tong fen liang	3000
+拓扑排序	tuo pu pai xu	3500
+最短路径	zui duan lu jing	4000
+最小生成树	zui xiao sheng cheng shu	3500
+动态规划	dong tai gui hua	6000
+贪心算法	tan xin suan fa	4000
+回溯算法	hui su suan fa	3500
+分治算法	fen zhi suan fa	3500
+二分查找	er fen cha zhao	4500
+滑动窗口	hua dong chuang kou	4500
+双指针	shuang zhi zhen	3500
+位运算	wei yun suan	4000
+时间复杂度	shi jian fu za du	4500
+空间复杂度	kong jian fu za du	4000
+微服务	wei fu wu	6000
+云原生	yun yuan sheng	4500
+容器化	rong qi hua	4000
+负载均衡	fu zai jun heng	5000
+服务发现	fu wu fa xian	3500
+熔断器	rong duan qi	3500
+限流	xian liu	4500
+高并发	gao bing fa	6000
+高可用	gao ke yong	5000
+低延迟	di yan chi	4500
+高吞吐	gao tun tu	3500
+最终一致性	zui zhong yi zhi xing	3500
+强一致性	qiang yi zhi xing	3500
+共识算法	gong shi suan fa	3500
+分库分表	fen ku fen biao	3500
+读写分离	du xie fen li	3500
+主从复制	zhu cong fu zhi	3500
+冷热分离	leng re fen li	2500
+缓存命中	huan cun ming zhong	3500
+缓存穿透	huan cun chuan tou	3500
+缓存击穿	huan cun ji chuan	3500
+缓存雪崩	huan cun xue beng	3500
+本地缓存	ben di huan cun	3500
+分布式缓存	fen bu shi huan cun	3500
+消息队列	xiao xi dui lie	5000
+异步解耦	yi bu jie ou	2500
+削峰填谷	xue feng tian gu	2500
+死信队列	si xin dui lie	2500
+序列化	xu lie hua	4500
+反序列化	fan xu lie hua	4000
+编解码	bian jie ma	4000
+套接字	tao jie zi	4000
+长连接	chang lian jie	4000
+短连接	duan lian jie	3500
+心跳包	xin tiao bao	3000
+粘包	zhan bao	3000
+拆包	chai bao	3000
+正向代理	zheng xiang dai li	3500
+反向代理	fan xiang dai li	4500
+路由表	lu you biao	3500
+子网掩码	zi wang yan ma	4000
+内网穿透	nei wang chuan tou	4000
+端口转发	duan kou zhuan fa	3500
+非对称加密	fei dui cheng jia mi	4000
+对称加密	dui cheng jia mi	4000
+哈希碰撞	ha xi peng zhuang	3000
+加盐	jia yan	3000
+鉴权	jian quan	4500
+越权	yue quan	4000
+回调函数	hui diao han shu	4500
+事件循环	shi jian xun huan	3500
+非阻塞	fei zu se	4000
+多路复用	duo lu fu yong	4000
+上下文切换	shang xia wen qie huan	3500
+系统调用	xi tong diao yong	4500
+内核态	nei he tai	4000
+用户态	yong hu tai	4000
+页表	ye biao	3500
+缺页中断	que ye zhong duan	3500
+虚拟内存	xu ni nei cun	4500
+物理内存	wu li nei cun	4500
+缓存行	huan cun hang	3000
+伪共享	wei gong xiang	2500
+分支预测	fen zhi yu ce	3500
+指令流水线	zhi ling liu shui xian	2500
+向量指令	xiang liang zhi ling	2500
+向量化	xiang liang hua	3500
+死锁	si suo	5000
+活锁	huo suo	2500
+竞态条件	jing tai tiao jian	3000
+互斥锁	hu chi suo	4000
+读写锁	du xie suo	4000
+自旋锁	zi xuan suo	3500
+乐观锁	le guan suo	4000
+悲观锁	bei guan suo	4000
+信号量	xin hao liang	4000
+条件变量	tiao jian bian liang	3500
+原子操作	yuan zi cao zuo	4000
+可重入	ke chong ru	3000
+线程安全	xian cheng an quan	4500
+压测	ya ce	4000
+基准测试	ji zhun ce shi	4000
+消融实验	xiao rong shi yan	3500
+回归测试	hui gui ce shi	4000
+单元测试	dan yuan ce shi	5000
+集成测试	ji cheng ce shi	4500
+端到端	duan dao duan	4500
+灰度发布	hui du fa bu	4000
+蓝绿部署	lan lv bu shu	3000
+金丝雀发布	jin si que fa bu	2500
+热更新	re geng xin	4500
+热重载	re chong zai	3500
+冷启动	leng qi dong	4500
+埋点	mai dian	4000
+链路追踪	lian lu zhui zong	3500
+可观测性	ke guan ce xing	3500
+技术债	ji shu zhai	3000
+抽象层	chou xiang ceng	3000
+静态链接	jing tai lian jie	3500
+动态链接	dong tai lian jie	4000
+语法树	yu fa shu	3500
+词法分析	ci fa fen xi	3500
+语法分析	yu fa fen xi	3500
+语义分析	yu yi fen xi	3500
+垃圾回收	la ji hui shou	4500
+引用计数	yin yong ji shu	3500
+逃逸分析	tao yi fen xi	3000
+内联优化	nei lian you hua	2500
+循环展开	xun huan zhan kai	2500
+类型推断	lei xing tui duan	3000
+类型擦除	lei xing ca chu	3000
+依赖注入	yi lai zhu ru	4000
+控制反转	kong zhi fan zhuan	3500
+单例模式	dan li mo shi	4000
+工厂模式	gong chang mo shi	4000
+观察者模式	guan cha zhe mo shi	3500
+策略模式	ce lve mo shi	3500
+有限状态机	you xian zhuang tai ji	3500
+状态机	zhuang tai ji	4000
+转义字符	zhuan yi zi fu	3500
+换行符	huan hang fu	4000
+占位符	zhan wei fu	4000
+守护进程	shou hu jin cheng	4000
+命名管道	ming ming guan dao	3500
+共享内存	gong xiang nei cun	4500
+软链接	ruan lian jie	3500
+硬链接	ying lian jie	3500
+符号链接	fu hao lian jie	3500
+代码评审	dai ma ping shen	3500
+持续集成	chi xu ji cheng	4000
+持续部署	chi xu bu shu	3500
+拉取请求	la qu qing qiu	3000
+合并冲突	he bing chong tu	3500
+变基	bian ji	2500
+暂存区	zan cun qu	3500
+交叉编译	jiao cha bian yi	3500
+开源协议	kai yuan xie yi	3500
+微调	wei tiao	5000
+重排器	chong pai qi	2500
+量化	liang hua	5000
+蒸馏	zheng liu	4000
+梯度	ti du	4500
+并发	bing fa	5000
+收敛	shou lian	4500
+正则表达式	zheng ze biao da shi	3500

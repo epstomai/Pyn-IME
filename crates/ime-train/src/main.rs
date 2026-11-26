@@ -22,6 +22,8 @@ const PROTECTED_FUNCTION_WORDS: &[&str] = &[
 struct TrainArgs {
     dicts_dir: PathBuf,
     allowed_chars_path: Option<PathBuf>,
+    ban_words_path: Option<PathBuf>,
+    extra_dicts: Vec<PathBuf>,
     corpora: Vec<PathBuf>,
     lexicon_path: Option<PathBuf>,
     out_path: PathBuf,
@@ -37,6 +39,8 @@ struct TrainArgs {
 fn parse_args() -> Result<TrainArgs, String> {
     let mut dicts_dir: Option<PathBuf> = None;
     let mut allowed_chars_path: Option<PathBuf> = None;
+    let mut ban_words_path: Option<PathBuf> = None;
+    let mut extra_dicts: Vec<PathBuf> = Vec::new();
     let mut corpora: Vec<PathBuf> = Vec::new();
     let mut lexicon_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
@@ -56,6 +60,13 @@ fn parse_args() -> Result<TrainArgs, String> {
                 allowed_chars_path =
                     Some(PathBuf::from(args.next().ok_or("--allowed-chars needs path")?))
             }
+            "--ban-words" => {
+                ban_words_path =
+                    Some(PathBuf::from(args.next().ok_or("--ban-words needs path")?))
+            }
+            "--extra-dict" => {
+                extra_dicts.push(PathBuf::from(args.next().ok_or("--extra-dict needs path")?))
+            }
             "--corpus" => corpora.push(PathBuf::from(args.next().ok_or("--corpus needs path")?)),
             "--lexicon" => lexicon_path = Some(PathBuf::from(args.next().ok_or("--lexicon needs path")?)),
             "--out" => out_path = Some(PathBuf::from(args.next().ok_or("--out needs path")?)),
@@ -73,6 +84,8 @@ fn parse_args() -> Result<TrainArgs, String> {
     Ok(TrainArgs {
         dicts_dir: dicts_dir.ok_or("--dicts is required")?,
         allowed_chars_path,
+        ban_words_path,
+        extra_dicts,
         corpora: if corpora.is_empty() {
             return Err("at least one --corpus is required".into());
         } else {
@@ -288,7 +301,7 @@ fn load_lexicon_filter(path: &Path) -> std::io::Result<HashSet<String>> {
     for line in reader.lines() {
         let w = line?;
         let w = w.trim();
-        if !w.is_empty() {
+        if !w.is_empty() && !w.starts_with('#') {
             set.insert(w.to_owned());
         }
     }
@@ -300,6 +313,8 @@ fn load_wanxiang_dicts(
     max_multi_words: usize,
     lexicon: Option<&HashSet<String>>,
     allowed_chars: Option<&HashSet<char>>,
+    ban_words: Option<&HashSet<String>>,
+    extra_dicts: &[PathBuf],
 ) -> std::io::Result<DictData> {
     // Accumulate word -> map<Vec<SyllableId>, u64 weight>
     let mut single_chars: HashMap<String, HashMap<Vec<SyllableId>, u64>> = HashMap::new();
@@ -316,6 +331,7 @@ fn load_wanxiang_dicts(
     ];
 
     let mut scratch = String::with_capacity(32);
+    let mut banned_skipped = 0usize;
     for (filename, is_zi, is_duoyin, is_proper) in files {
         let path = dicts_dir.join(filename);
         let file = File::open(&path)?;
@@ -355,6 +371,10 @@ fn load_wanxiang_dicts(
             if !is_zi && (char_len < 2 || char_len > 6) {
                 continue;
             }
+            if !is_zi && ban_words.is_some_and(|b| b.contains(word)) {
+                banned_skipped += 1;
+                continue;
+            }
             if !is_zi {
                 if let Some(lex) = lexicon {
                     let allowed = lex.contains(word) || (is_proper && weight >= 1000);
@@ -369,6 +389,10 @@ fn load_wanxiang_dicts(
             };
 
             if is_zi {
+                // In Simplified Chinese, 著 is read zhù/zhuó (never zhe; 着 is the Simplified particle).
+                if word == "著" && syls.len() == 1 && syls[0] == syllable_id("zhe").unwrap() {
+                    continue;
+                }
                 let entry = single_chars.entry(word.to_owned()).or_default();
                 *entry.entry(syls).or_insert(0) += weight;
             } else {
@@ -379,6 +403,64 @@ fn load_wanxiang_dicts(
                 *entry.entry(syls).or_insert(0) += weight;
             }
         }
+    }
+
+    let mut extra_loaded = 0usize;
+    for extra_path in extra_dicts {
+        let content = std::fs::read_to_string(extra_path)?;
+        let has_yaml_sep = content.lines().any(|l| l.trim() == "...");
+        let mut in_body = !has_yaml_sep;
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if !in_body {
+                if line == "..." {
+                    in_body = true;
+                }
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let Some(word) = parts.next().map(str::trim) else {
+                continue;
+            };
+            let Some(py_raw) = parts.next().map(str::trim) else {
+                continue;
+            };
+            let weight: u64 = parts
+                .next()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(1000)
+                .max(1);
+            let char_len = word.chars().count();
+            if !(2..=6).contains(&char_len) || !word.chars().all(is_hanzi) {
+                continue;
+            }
+            if let Some(allowed) = allowed_chars {
+                if !word.chars().all(|c| allowed.contains(&c)) {
+                    continue;
+                }
+            }
+            if ban_words.is_some_and(|b| b.contains(word)) {
+                continue;
+            }
+            let Some(syls) = parse_syllables(py_raw, char_len, &mut scratch) else {
+                continue;
+            };
+            protected_duoyin.insert(word.to_owned());
+            let entry = multi_words.entry(word.to_owned()).or_default();
+            entry
+                .entry(syls)
+                .and_modify(|v| *v = (*v).max(weight))
+                .or_insert(weight);
+            extra_loaded += 1;
+        }
+    }
+    if banned_skipped > 0 || extra_loaded > 0 {
+        println!(
+            "[dict] ban_skipped={banned_skipped} extra_loaded={extra_loaded}"
+        );
     }
 
     // Select all single chars + duoyin + top `max_multi_words` multi-char words by total weight.
@@ -932,11 +1014,17 @@ fn main() -> std::io::Result<()> {
         Some(p) => Some(load_allowed_chars(p)?),
         None => None,
     };
+    let ban_words = match &args.ban_words_path {
+        Some(p) => Some(load_lexicon_filter(p)?),
+        None => None,
+    };
     let dict = load_wanxiang_dicts(
         &args.dicts_dir,
         args.max_multi_words,
         lexicon.as_ref(),
         allowed_chars.as_ref(),
+        ban_words.as_ref(),
+        &args.extra_dicts,
     )?;
     let num_words = dict.dict_weights.len();
     let total_dict_weight: f64 = dict.dict_weights[FIRST_REAL_WORD_ID as usize..].iter().sum();

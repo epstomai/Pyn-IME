@@ -22,6 +22,15 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit
 }
 
+# Wait for regsvr32 itself only: `Start-Process -Wait` also waits for descendants, and activating
+# the TIP spawns the long-lived ime-server.exe, which would block the script indefinitely.
+function Invoke-Regsvr([string]$exe, [string[]]$arguments) {
+    $p = Start-Process $exe -ArgumentList $arguments -PassThru
+    $null = $p.Handle  # cache the handle so ExitCode is available after exit
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+
 function Finish([int]$code) {
     if (-not $NoPause) { Read-Host '按回车键退出' | Out-Null }
     exit $code
@@ -37,7 +46,11 @@ public static extern bool MoveFileEx(string src, string dst, int flags);
 
     $srv = Join-Path $Dir 'ime-server.exe'
     if (Test-Path -LiteralPath $srv) {
-        & $srv --shutdown 2>$null | Out-Null
+        # Best effort: fails harmlessly when the service is not running.
+        try {
+            $sp = Start-Process $srv -ArgumentList '--shutdown' -WindowStyle Hidden -PassThru
+            $null = $sp.WaitForExit(5000)
+        } catch { }
         Start-Sleep -Milliseconds 800
     }
     Get-Process ime-server -ErrorAction SilentlyContinue |
@@ -51,10 +64,10 @@ public static extern bool MoveFileEx(string src, string dst, int flags);
     $dll86 = Join-Path $Dir 'ime_tsf_x86.dll'
     $dll64 = Join-Path $Dir 'ime_tsf.dll'
     if ((Test-Path -LiteralPath $reg32) -and (Test-Path -LiteralPath $dll86)) {
-        Start-Process $reg32 -ArgumentList @('/u', '/s', "`"$dll86`"") -Wait | Out-Null
+        Invoke-Regsvr $reg32 @('/u', '/s', "`"$dll86`"") | Out-Null
     }
     if (Test-Path -LiteralPath $dll64) {
-        Start-Process $reg64 -ArgumentList @('/u', '/s', "`"$dll64`"") -Wait | Out-Null
+        Invoke-Regsvr $reg64 @('/u', '/s', "`"$dll64`"") | Out-Null
     }
 
     Remove-Item -Recurse -Force -Path "HKCU:\Software\Microsoft\CTF\TIP\$Clsid" -ErrorAction SilentlyContinue

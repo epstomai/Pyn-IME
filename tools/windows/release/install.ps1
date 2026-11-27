@@ -26,6 +26,15 @@ if (-not (Test-Admin)) {
     exit
 }
 
+# Wait for regsvr32 itself only: `Start-Process -Wait` also waits for descendants, and activating
+# the TIP spawns the long-lived ime-server.exe, which would block the script indefinitely.
+function Invoke-Regsvr([string]$exe, [string[]]$arguments) {
+    $p = Start-Process $exe -ArgumentList $arguments -PassThru
+    $null = $p.Handle  # cache the handle so ExitCode is available after exit
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+
 function Finish([int]$code) {
     if (-not $NoPause) { Read-Host '按回车键退出' | Out-Null }
     exit $code
@@ -44,7 +53,11 @@ try {
     # 停止旧的后台服务（模型/词库常驻进程），让 exe 和模型可以覆盖。
     $srv = Join-Path $Dir 'ime-server.exe'
     if (Test-Path -LiteralPath $srv) {
-        & $srv --shutdown 2>$null | Out-Null
+        # Best effort: fails harmlessly when the service is not running.
+        try {
+            $sp = Start-Process $srv -ArgumentList '--shutdown' -WindowStyle Hidden -PassThru
+            $null = $sp.WaitForExit(5000)
+        } catch { }
         Start-Sleep -Milliseconds 800
     }
     Get-Process ime-server -ErrorAction SilentlyContinue |
@@ -71,11 +84,11 @@ try {
     $reg64 = Join-Path $env:windir 'System32\regsvr32.exe'
     $reg32 = Join-Path $env:windir 'SysWOW64\regsvr32.exe'
     if (Test-Path -LiteralPath $reg32) {
-        $p = Start-Process $reg32 -ArgumentList @('/s', "`"$(Join-Path $Dir 'ime_tsf_x86.dll')`"") -Wait -PassThru
-        if ($p.ExitCode -ne 0) { throw "注册 32 位 DLL 失败（regsvr32 退出码 $($p.ExitCode)）" }
+        $rc = Invoke-Regsvr $reg32 @('/s', "`"$(Join-Path $Dir 'ime_tsf_x86.dll')`"")
+        if ($rc -ne 0) { throw "注册 32 位 DLL 失败（regsvr32 退出码 $rc）" }
     }
-    $p = Start-Process $reg64 -ArgumentList @('/s', "`"$(Join-Path $Dir 'ime_tsf.dll')`"") -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "注册 64 位 DLL 失败（regsvr32 退出码 $($p.ExitCode)）" }
+    $rc = Invoke-Regsvr $reg64 @('/s', "`"$(Join-Path $Dir 'ime_tsf.dll')`"")
+    if ($rc -ne 0) { throw "注册 64 位 DLL 失败（regsvr32 退出码 $rc）" }
 
     Add-Type -Namespace Pyn -Name Input -MemberDefinition @'
 [DllImport("input.dll", CharSet = CharSet.Unicode)]
@@ -88,7 +101,7 @@ public static extern bool InstallLayoutOrTip(string psz, uint dwFlags);
     Set-ItemProperty -Path $profKey -Name Enable -Value 1 -Type DWord
 
     # 让当前会话立即可用（无需注销）。
-    Start-Process $reg64 -ArgumentList @('/n', '/i:activate', '/s', "`"$(Join-Path $Dir 'ime_tsf.dll')`"") -Wait | Out-Null
+    Invoke-Regsvr $reg64 @('/n', '/i:activate', '/s', "`"$(Join-Path $Dir 'ime_tsf.dll')`"") | Out-Null
 
     # 开机自启后台服务；输入法首次使用时也会自动拉起。
     $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'

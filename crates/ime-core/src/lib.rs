@@ -1162,6 +1162,8 @@ mod tests {
         let jia_out = decode_rich_with_user(&model, None, None, "jia", "", 200, &cfg);
         assert!(jia_out.items.len() >= 30, "expected >= 30 items for jia, got {}", jia_out.items.len());
         assert!(jia_out.items.iter().any(|it| it.text == "嘉"));
+        assert_eq!(jia_out.full_candidates.len(), jia_out.items.len());
+        assert!(jia_out.full_candidates.iter().any(|s| s == "嘉"));
 
         // `xian` keeps genuine lexicon word `西安` AND single char `西`.
         let xian_out = decode_rich_with_user(&model, None, None, "xian", "", 50, &cfg);
@@ -1174,6 +1176,16 @@ mod tests {
         assert_eq!(jlc_out.first_syllable_len, 3);
         let full_cnt = jlc_out.items.iter().filter(|it| it.kind == CandidateKind::Full).count();
         assert!(full_cnt <= 3);
+        assert!(!jlc_out.full_candidates.is_empty());
+        assert_eq!(
+            jlc_out.full_candidates.first().map(String::as_str),
+            jlc_out.items.first().map(|it| it.text.as_str())
+        );
+        assert!(
+            jlc_out.full_candidates.iter().all(|s| s.chars().count() == 3),
+            "legacy full_candidates must never leak partial prefixes: {:?}",
+            jlc_out.full_candidates
+        );
         let prefix_words: Vec<&str> = jlc_out
             .items
             .iter()
@@ -1605,7 +1617,7 @@ mod tests {
         for unr in ["config", "git", "github"] {
             let out = decode_rich_with_user(&model, None, None, unr, "", 250, &cfg);
             assert!(
-                out.items.is_empty(),
+                out.items.is_empty() && out.full_candidates.is_empty(),
                 "expected unreachable '{unr}' to yield empty items, got {:?}",
                 out.items
             );
@@ -1617,7 +1629,7 @@ mod tests {
         for eng in ["liltoon", "nilotoon", "lilto", "niloto", "toon", "code"] {
             let out = decode_rich_with_user(&model, None, None, eng, "", 250, &cfg);
             assert!(
-                out.items.is_empty(),
+                out.items.is_empty() && out.full_candidates.is_empty(),
                 "expected English '{eng}' to yield empty items, got {:?}",
                 out.items
             );

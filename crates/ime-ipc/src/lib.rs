@@ -880,6 +880,54 @@ mod tests {
                 learn_text: None,
             }
         );
+
+        // 5. 2-syllable `ceshi` with page_size=6: picking #4 `测` (consumed_len=2) locks `测` and keeps `shi`.
+        s.set_page_size(6);
+        for ch in "ceshi".chars() {
+            assert_eq!(
+                s.handle_key(KeyEvent::Char(ch), none),
+                KeyAction::UpdateComposition { need_convert: true }
+            );
+        }
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "测试".into(), consumed_len: 5, kind: WireCandidateKind::Full },
+                WireCandidate { text: "策士".into(), consumed_len: 5, kind: WireCandidateKind::Full },
+                WireCandidate { text: "测时".into(), consumed_len: 5, kind: WireCandidateKind::Full },
+                WireCandidate { text: "测".into(), consumed_len: 2, kind: WireCandidateKind::PrefixChar },
+                WireCandidate { text: "侧".into(), consumed_len: 2, kind: WireCandidateKind::PrefixChar },
+                WireCandidate { text: "策".into(), consumed_len: 2, kind: WireCandidateKind::PrefixChar },
+            ],
+            Some("ce'shi".into()),
+            Some(3),
+            2,
+        );
+        assert_eq!(
+            s.handle_key(KeyEvent::Digit(4), none),
+            KeyAction::UpdateComposition { need_convert: true }
+        );
+        assert!(s.has_locked());
+        assert_eq!(s.locked_text(), "测");
+        assert_eq!(s.keys(), "shi");
+        assert_eq!(s.inline_preedit(), "测shi");
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "试".into(), consumed_len: 3, kind: WireCandidateKind::Full },
+                WireCandidate { text: "时".into(), consumed_len: 3, kind: WireCandidateKind::Full },
+            ],
+            Some("shi".into()),
+            Some(0),
+            3,
+        );
+        assert_eq!(
+            s.handle_key(KeyEvent::Digit(1), none),
+            KeyAction::Commit {
+                text: "测试".into(),
+                learn_keys: Some("ceshi".into()),
+                learn_text: Some("测试".into()),
+            }
+        );
+        assert!(!s.is_composing());
     }
 
     #[test]

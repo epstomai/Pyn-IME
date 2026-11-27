@@ -297,7 +297,19 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                 limit,
                 &dcfg,
             );
-            let candidates: Vec<String> = outcome.items.iter().map(|it| it.text.clone()).collect();
+            // Keep legacy `candidates` strictly full-span so pre-segment-locking TSF DLLs
+            // still loaded in long-running apps never receive partial prefix items that would
+            // commit early and drop trailing pinyin. Rich clients (>= 118d896) read `items`.
+            let candidates: Vec<String> = if !outcome.full_candidates.is_empty() {
+                outcome.full_candidates
+            } else {
+                outcome
+                    .items
+                    .iter()
+                    .filter(|it| it.kind == CandidateKind::Full)
+                    .map(|it| it.text.clone())
+                    .collect()
+            };
             let items: Vec<WireCandidate> = outcome
                 .items
                 .into_iter()

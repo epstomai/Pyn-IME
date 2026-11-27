@@ -78,6 +78,7 @@ pub struct CandidateItem {
 #[derive(Debug, Clone, Default)]
 pub struct RichDecodeOutcome {
     pub items: Vec<CandidateItem>,
+    pub full_candidates: Vec<String>,
     pub base_top1: Option<String>,
     pub segmented_preedit: String,
     pub first_char_offset: Option<usize>,
@@ -327,6 +328,7 @@ pub fn decode_rich_with_user(
     if let Some(outcome) =
         try_decode_single_unit(model, reranker, &dag, &ctx, context_text, eff_eos, limit, cfg)
     {
+        let full_candidates = outcome.candidates.clone();
         let items = outcome
             .candidates
             .into_iter()
@@ -338,6 +340,7 @@ pub fn decode_rich_with_user(
             .collect();
         return RichDecodeOutcome {
             items,
+            full_candidates,
             base_top1: outcome.base_top1,
             segmented_preedit: keys.to_owned(),
             first_char_offset: Some(0),
@@ -373,6 +376,7 @@ pub fn decode_rich_with_user(
             cfg,
         );
         apply_staged_oov_for_dag(&dag, active_user, limit, &mut outcome);
+        let full_candidates = outcome.candidates.clone();
         let items = outcome
             .candidates
             .into_iter()
@@ -384,6 +388,7 @@ pub fn decode_rich_with_user(
             .collect();
         return RichDecodeOutcome {
             items,
+            full_candidates,
             base_top1: outcome.base_top1,
             segmented_preedit: keys.to_owned(),
             first_char_offset: Some(0),
@@ -448,6 +453,7 @@ pub fn decode_rich_with_user(
     if finals.is_empty() || is_likely_non_pinyin(model, &dag, &beam_res, &oov_pool, keys) {
         return RichDecodeOutcome {
             items: Vec::new(),
+            full_candidates: Vec::new(),
             base_top1: None,
             segmented_preedit: keys.to_owned(),
             first_char_offset: None,
@@ -475,8 +481,11 @@ pub fn decode_rich_with_user(
     let mut items: Vec<CandidateItem> = Vec::with_capacity(limit.min(64));
     let mut seen_items: HashSet<(String, usize)> = HashSet::new();
 
-    // Tier 1: concise full-span candidates (keep up to 3 so multi-word #3 e.g. `原工程` surfaces on page 1).
+    // Tier 1: concise full-span candidates (keep up to 3 so multi-word #3 e.g. `原工程` surfaces on page 1),
+    // while preserving up to `limit` full-span candidates for legacy pre-segment-locking clients.
     let mut base_top1 = None;
+    let mut full_candidates: Vec<String> = Vec::new();
+    let mut seen_full: HashSet<String> = HashSet::new();
     if !finals.is_empty() {
         let scored = score_beam_candidates(
             model,
@@ -492,11 +501,14 @@ pub fn decode_rich_with_user(
         base_top1 = full_outcome.base_top1;
 
         const MAX_FULL: usize = 3;
-        for text in full_outcome.candidates.into_iter().take(MAX_FULL) {
-            if items.len() >= limit {
-                break;
+        for text in full_outcome.candidates {
+            if full_candidates.len() < limit && seen_full.insert(text.clone()) {
+                full_candidates.push(text.clone());
             }
-            if seen_items.insert((text.clone(), keys.len())) {
+            if items.len() < MAX_FULL
+                && items.len() < limit
+                && seen_items.insert((text.clone(), keys.len()))
+            {
                 items.push(CandidateItem {
                     text,
                     consumed_len: keys.len(),
@@ -504,9 +516,15 @@ pub fn decode_rich_with_user(
                 });
             }
         }
-        if items.len() < MAX_FULL && items.len() < limit {
+        if full_candidates.len() < limit || (items.len() < MAX_FULL && items.len() < limit) {
             if let Some(exact_top) = exact_fallback_top1 {
-                if seen_items.insert((exact_top.clone(), keys.len())) {
+                if full_candidates.len() < limit && seen_full.insert(exact_top.clone()) {
+                    full_candidates.push(exact_top.clone());
+                }
+                if items.len() < MAX_FULL
+                    && items.len() < limit
+                    && seen_items.insert((exact_top.clone(), keys.len()))
+                {
                     items.push(CandidateItem {
                         text: exact_top,
                         consumed_len: keys.len(),
@@ -710,6 +728,7 @@ pub fn decode_rich_with_user(
 
     RichDecodeOutcome {
         items,
+        full_candidates,
         base_top1,
         segmented_preedit,
         first_char_offset,

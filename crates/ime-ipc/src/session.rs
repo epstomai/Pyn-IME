@@ -997,6 +997,19 @@ impl SessionController {
         (page_idx, total_pages, &view[start..end], sel - start)
     }
 
+    pub fn all_candidates(&self) -> &[String] {
+        let view_start = self.active_view_start();
+        &self.candidates[view_start..]
+    }
+
+    pub fn pick_candidate(&mut self, rel_idx: usize) -> KeyAction {
+        if let Some(choice) = self.active_choice_at(rel_idx) {
+            self.apply_choice(choice)
+        } else {
+            KeyAction::ConsumedNoChange
+        }
+    }
+
     pub fn reset_composing(&mut self) {
         self.locked_segments.clear();
         self.keys.clear();

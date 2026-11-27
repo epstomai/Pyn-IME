@@ -4,11 +4,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
+#[cfg(windows)]
 use windows_core::PCWSTR;
 
+#[cfg(windows)]
 use crate::pipe::to_wide_null;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -126,16 +129,23 @@ impl ImeConfig {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("json encode: {e}")))?;
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, json)?;
-        let wide_src = to_wide_null(&tmp_path.to_string_lossy());
-        let wide_dst = to_wide_null(&path.to_string_lossy());
-        unsafe {
-            MoveFileExW(
-                PCWSTR(wide_src.as_ptr()),
-                PCWSTR(wide_dst.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
+        #[cfg(windows)]
+        {
+            let wide_src = to_wide_null(&tmp_path.to_string_lossy());
+            let wide_dst = to_wide_null(&path.to_string_lossy());
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(wide_src.as_ptr()),
+                    PCWSTR(wide_dst.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(|e| io::Error::from_raw_os_error(e.code().0))
         }
-        .map_err(|e| io::Error::from_raw_os_error(e.code().0))
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&tmp_path, path)
+        }
     }
 }
 

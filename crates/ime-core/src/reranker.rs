@@ -90,6 +90,74 @@ pub enum PackedPanels {
         row_bias: Vec<f32>,
     },
     F32(Vec<f32>),
+    /// AArch64 dot-product (`sdot`) path: same `[out/16, in/4, 16, 4]` signed `i8` layout as
+    /// `I8Vnni`, but activations are quantized symmetrically to `i8`, so no zero-point bias.
+    I8Sdot {
+        panels: Vec<i8>,
+        /// Per-output-channel quantization scale `[out_dim]`.
+        scales: Vec<f32>,
+    },
+}
+
+/// Whether `from_row_major_f16` should pack weights for the `sdot` int8 path. On AArch64 this is
+/// the `dotprod` extension; `PYN_FORCE_SDOT` forces it elsewhere so the bit-exact scalar reference
+/// can be evaluated on a desktop.
+fn sdot_packing_enabled() -> bool {
+    if std::env::var_os("PYN_FORCE_SDOT").is_some() {
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Per-output-channel symmetric `i8` quantization into `[out/16, in/4, 16, 4]` panels.
+/// Returns `(panels, scales, row_bias)` where `row_bias[o] = scales[o] * sum_k(w_i8[o, k])`.
+fn quantize_weight_panels_i8(raw: &[u16], out_dim: usize, in_dim: usize) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
+    let num_blocks = out_dim / 16;
+    let k_groups = in_dim / 4;
+    let mut panels = vec![0i8; num_blocks * k_groups * 16 * 4];
+    let mut scales = vec![0.0_f32; out_dim];
+    let mut row_bias = vec![0.0_f32; out_dim];
+    for o in 0..out_dim {
+        let row = &raw[o * in_dim..(o + 1) * in_dim];
+        let mut max_abs = 0.0_f32;
+        for &bits in row {
+            let av = f16_to_f32(bits).abs();
+            if av > max_abs {
+                max_abs = av;
+            }
+        }
+        let (scale, inv_scale) = if max_abs < 1e-12_f32 {
+            (0.0, 0.0)
+        } else {
+            (max_abs / 127.0_f32, 127.0_f32 / max_abs)
+        };
+        scales[o] = scale;
+        let blk = o / 16;
+        let lane = o % 16;
+        let mut sum_i32 = 0i32;
+        for k4 in 0..k_groups {
+            let base_dst = (blk * k_groups + k4) * 64 + lane * 4;
+            for t in 0..4 {
+                let w = f16_to_f32(row[k4 * 4 + t]);
+                let q = if inv_scale == 0.0 {
+                    0i8
+                } else {
+                    (w * inv_scale).round_ties_even().clamp(-127.0, 127.0) as i8
+                };
+                panels[base_dst + t] = q;
+                sum_i32 += q as i32;
+            }
+        }
+        row_bias[o] = scale * (sum_i32 as f32);
+    }
+    (panels, scales, row_bias)
 }
 
 /// Matrix `[out_dim, in_dim]` packed for SIMD GEMM (`I8Vnni` `[out/16, in/4, 16, 4]` or `F32` `[out/16, in, 16]`).
@@ -139,53 +207,17 @@ impl PackedMatrix {
             }
         };
 
+        if in_dim % 4 == 0 && sdot_packing_enabled() {
+            let (panels, scales, _) = quantize_weight_panels_i8(raw, out_dim, in_dim);
+            return Self {
+                out_dim,
+                in_dim,
+                panels: PackedPanels::I8Sdot { panels, scales },
+            };
+        }
+
         if use_vnni {
-            let num_blocks = out_dim / 16;
-            let k_groups = in_dim / 4;
-            let mut panels = vec![0i8; num_blocks * k_groups * 16 * 4];
-            let mut scales = vec![0.0_f32; out_dim];
-            let mut row_bias = vec![0.0_f32; out_dim];
-
-            for o in 0..out_dim {
-                let row = &raw[o * in_dim..(o + 1) * in_dim];
-                let mut max_abs = 0.0_f32;
-                for &bits in row {
-                    let av = f16_to_f32(bits).abs();
-                    if av > max_abs {
-                        max_abs = av;
-                    }
-                }
-                let scale = if max_abs < 1e-12_f32 {
-                    0.0
-                } else {
-                    max_abs / 127.0_f32
-                };
-                let inv_scale = if max_abs < 1e-12_f32 {
-                    0.0
-                } else {
-                    127.0_f32 / max_abs
-                };
-                scales[o] = scale;
-
-                let blk = o / 16;
-                let lane = o % 16;
-                let mut sum_i32 = 0i32;
-                for k4 in 0..k_groups {
-                    let base_dst = (blk * k_groups + k4) * 64 + lane * 4;
-                    for t in 0..4 {
-                        let w = f16_to_f32(row[k4 * 4 + t]);
-                        let q = if inv_scale == 0.0 {
-                            0i8
-                        } else {
-                            (w * inv_scale).round_ties_even().clamp(-127.0, 127.0) as i8
-                        };
-                        panels[base_dst + t] = q;
-                        sum_i32 += q as i32;
-                    }
-                }
-                row_bias[o] = scale * (sum_i32 as f32);
-            }
-
+            let (panels, scales, row_bias) = quantize_weight_panels_i8(raw, out_dim, in_dim);
             return Self {
                 out_dim,
                 in_dim,
@@ -222,6 +254,7 @@ impl PackedMatrix {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct VnniScratch {
     a_u8: Vec<u8>,
@@ -229,8 +262,24 @@ struct VnniScratch {
     a_mins: Vec<f32>,
 }
 
+#[cfg(target_arch = "x86_64")]
 thread_local! {
     static VNNI_SCRATCH: RefCell<VnniScratch> = RefCell::new(VnniScratch::default());
+}
+
+/// Symmetric per-row `i8` quantization; returns the dequantization scale (`0` for an all-zero row).
+#[inline]
+fn quantize_row_i8_sym_scalar(a_row: &[f32], dst: &mut [i8]) -> f32 {
+    let max_abs = a_row.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+    if max_abs < 1e-12_f32 {
+        dst.fill(0);
+        return 0.0;
+    }
+    let inv = 127.0_f32 / max_abs;
+    for (d, &v) in dst.iter_mut().zip(a_row) {
+        *d = (v * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+    }
+    max_abs / 127.0_f32
 }
 
 #[inline]
@@ -419,6 +468,30 @@ pub fn gemm_packed_scalar(a: &[f32], m: usize, k: usize, b: &PackedMatrix, out: 
                         let o = blk * 16 + lane;
                         o_row[o] =
                             (acc[lane] as f32).mul_add(scale_a * scales[o], min_a * row_bias[o]);
+                    }
+                }
+            }
+        }
+        PackedPanels::I8Sdot { panels, scales } => {
+            let k_groups = k / 4;
+            let mut q_row = vec![0i8; k];
+            for row in 0..m {
+                let scale_a = quantize_row_i8_sym_scalar(&a[row * k..(row + 1) * k], &mut q_row);
+                let o_row = &mut out[row * b.out_dim..(row + 1) * b.out_dim];
+                for blk in 0..num_blocks {
+                    let mut acc = [0i32; 16];
+                    for k4 in 0..k_groups {
+                        let p_base = (blk * k_groups + k4) * 64;
+                        for lane in 0..16 {
+                            let w_base = p_base + lane * 4;
+                            for t in 0..4 {
+                                acc[lane] += q_row[k4 * 4 + t] as i32 * panels[w_base + t] as i32;
+                            }
+                        }
+                    }
+                    for lane in 0..16 {
+                        let o = blk * 16 + lane;
+                        o_row[o] = acc[lane] as f32 * (scale_a * scales[o]);
                     }
                 }
             }
@@ -794,6 +867,313 @@ unsafe fn gemm_packed_i8_avxvnni(
     });
 }
 
+/// AArch64 NEON f32 GEMM over `[out/16, in, 16]` panels: 4 rows x 16 outputs per inner loop
+/// (16 accumulators), so each loaded weight vector feeds four FMAs.
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_packed_f32_neon(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    panels: &[f32],
+    out_dim: usize,
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let num_blocks = out_dim / 16;
+    let a_ptr = a.as_ptr();
+    let b_ptr = panels.as_ptr();
+    let o_ptr = out.as_mut_ptr();
+
+    let mut row = 0usize;
+    while row + 4 <= m {
+        let a0 = a_ptr.add(row * k);
+        let a1 = a_ptr.add((row + 1) * k);
+        let a2 = a_ptr.add((row + 2) * k);
+        let a3 = a_ptr.add((row + 3) * k);
+        for blk in 0..num_blocks {
+            let z = vdupq_n_f32(0.0);
+            let (mut c00, mut c01, mut c02, mut c03) = (z, z, z, z);
+            let (mut c10, mut c11, mut c12, mut c13) = (z, z, z, z);
+            let (mut c20, mut c21, mut c22, mut c23) = (z, z, z, z);
+            let (mut c30, mut c31, mut c32, mut c33) = (z, z, z, z);
+            let mut p = b_ptr.add(blk * k * 16);
+            for kk in 0..k {
+                let b0 = vld1q_f32(p);
+                let b1 = vld1q_f32(p.add(4));
+                let b2 = vld1q_f32(p.add(8));
+                let b3 = vld1q_f32(p.add(12));
+                let x0 = vdupq_n_f32(*a0.add(kk));
+                c00 = vfmaq_f32(c00, b0, x0);
+                c01 = vfmaq_f32(c01, b1, x0);
+                c02 = vfmaq_f32(c02, b2, x0);
+                c03 = vfmaq_f32(c03, b3, x0);
+                let x1 = vdupq_n_f32(*a1.add(kk));
+                c10 = vfmaq_f32(c10, b0, x1);
+                c11 = vfmaq_f32(c11, b1, x1);
+                c12 = vfmaq_f32(c12, b2, x1);
+                c13 = vfmaq_f32(c13, b3, x1);
+                let x2 = vdupq_n_f32(*a2.add(kk));
+                c20 = vfmaq_f32(c20, b0, x2);
+                c21 = vfmaq_f32(c21, b1, x2);
+                c22 = vfmaq_f32(c22, b2, x2);
+                c23 = vfmaq_f32(c23, b3, x2);
+                let x3 = vdupq_n_f32(*a3.add(kk));
+                c30 = vfmaq_f32(c30, b0, x3);
+                c31 = vfmaq_f32(c31, b1, x3);
+                c32 = vfmaq_f32(c32, b2, x3);
+                c33 = vfmaq_f32(c33, b3, x3);
+                p = p.add(16);
+            }
+            let col = blk * 16;
+            let o0 = o_ptr.add(row * out_dim + col);
+            let o1 = o_ptr.add((row + 1) * out_dim + col);
+            let o2 = o_ptr.add((row + 2) * out_dim + col);
+            let o3 = o_ptr.add((row + 3) * out_dim + col);
+            vst1q_f32(o0, c00);
+            vst1q_f32(o0.add(4), c01);
+            vst1q_f32(o0.add(8), c02);
+            vst1q_f32(o0.add(12), c03);
+            vst1q_f32(o1, c10);
+            vst1q_f32(o1.add(4), c11);
+            vst1q_f32(o1.add(8), c12);
+            vst1q_f32(o1.add(12), c13);
+            vst1q_f32(o2, c20);
+            vst1q_f32(o2.add(4), c21);
+            vst1q_f32(o2.add(8), c22);
+            vst1q_f32(o2.add(12), c23);
+            vst1q_f32(o3, c30);
+            vst1q_f32(o3.add(4), c31);
+            vst1q_f32(o3.add(8), c32);
+            vst1q_f32(o3.add(12), c33);
+        }
+        row += 4;
+    }
+
+    while row < m {
+        let a0 = a_ptr.add(row * k);
+        for blk in 0..num_blocks {
+            let z = vdupq_n_f32(0.0);
+            let (mut c0, mut c1, mut c2, mut c3) = (z, z, z, z);
+            let mut p = b_ptr.add(blk * k * 16);
+            for kk in 0..k {
+                let x = vdupq_n_f32(*a0.add(kk));
+                c0 = vfmaq_f32(c0, vld1q_f32(p), x);
+                c1 = vfmaq_f32(c1, vld1q_f32(p.add(4)), x);
+                c2 = vfmaq_f32(c2, vld1q_f32(p.add(8)), x);
+                c3 = vfmaq_f32(c3, vld1q_f32(p.add(12)), x);
+                p = p.add(16);
+            }
+            let o0 = o_ptr.add(row * out_dim + blk * 16);
+            vst1q_f32(o0, c0);
+            vst1q_f32(o0.add(4), c1);
+            vst1q_f32(o0.add(8), c2);
+            vst1q_f32(o0.add(12), c3);
+        }
+        row += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let len = a.len().min(b.len());
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    let z = vdupq_n_f32(0.0);
+    let (mut s0, mut s1, mut s2, mut s3) = (z, z, z, z);
+    let mut i = 0usize;
+    while i + 16 <= len {
+        s0 = vfmaq_f32(s0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+        s1 = vfmaq_f32(s1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
+        s2 = vfmaq_f32(s2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
+        s3 = vfmaq_f32(s3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
+        i += 16;
+    }
+    while i + 4 <= len {
+        s0 = vfmaq_f32(s0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+        i += 4;
+    }
+    let mut total = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+    while i < len {
+        total += *ap.add(i) * *bp.add(i);
+        i += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Default)]
+struct SdotScratch {
+    a_i8: Vec<i8>,
+    a_scales: Vec<f32>,
+}
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    static SDOT_SCRATCH: RefCell<SdotScratch> = RefCell::new(SdotScratch::default());
+}
+
+/// NEON symmetric `i8` row quantization (round-to-nearest-even, matches the scalar reference).
+#[cfg(target_arch = "aarch64")]
+unsafe fn quantize_row_i8_sym_neon(a_row: &[f32], dst: &mut [i8]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let k = a_row.len();
+    let ap = a_row.as_ptr();
+    let mut vmax = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+    while i + 4 <= k {
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(ap.add(i))));
+        i += 4;
+    }
+    let mut max_abs = vmaxvq_f32(vmax);
+    while i < k {
+        max_abs = max_abs.max((*ap.add(i)).abs());
+        i += 1;
+    }
+    if max_abs < 1e-12_f32 {
+        dst.fill(0);
+        return 0.0;
+    }
+    let inv = 127.0_f32 / max_abs;
+    let vinv = vdupq_n_f32(inv);
+    let dp = dst.as_mut_ptr();
+    let mut i = 0usize;
+    while i + 8 <= k {
+        let q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(ap.add(i)), vinv));
+        let q1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(ap.add(i + 4)), vinv));
+        let h = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+        let b = vmax_s8(vqmovn_s16(h), vdup_n_s8(-127));
+        vst1_s8(dp.add(i), b);
+        i += 8;
+    }
+    while i < k {
+        *dp.add(i) = ((*ap.add(i)) * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+        i += 1;
+    }
+    max_abs / 127.0_f32
+}
+
+/// AArch64 `sdot` int8 GEMM over `[out/16, in/4, 16, 4]` panels: 4 rows x 16 outputs per pass,
+/// one `sdot` = 16 multiply-adds. Integer accumulation is exact, so results match
+/// `gemm_packed_scalar`'s `I8Sdot` reference bit-for-bit.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn gemm_packed_i8_sdot(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    panels: &[i8],
+    scales: &[f32],
+    out_dim: usize,
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    SDOT_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let sc = &mut *guard;
+        sc.a_i8.resize(m * k, 0);
+        sc.a_scales.resize(m, 0.0);
+        for r in 0..m {
+            sc.a_scales[r] =
+                quantize_row_i8_sym_neon(&a[r * k..(r + 1) * k], &mut sc.a_i8[r * k..(r + 1) * k]);
+        }
+
+        let num_blocks = out_dim / 16;
+        let k_groups = k / 4;
+        let a_ptr = sc.a_i8.as_ptr();
+        let b_ptr = panels.as_ptr();
+        let s_ptr = scales.as_ptr();
+        let o_ptr = out.as_mut_ptr();
+
+        #[inline(always)]
+        unsafe fn bcast4(p: *const i8) -> int8x16_t {
+            vreinterpretq_s8_s32(vdupq_n_s32(std::ptr::read_unaligned(p as *const i32)))
+        }
+        #[inline(always)]
+        unsafe fn store_scaled(o: *mut f32, s: *const f32, sa: f32, c0: int32x4_t, c1: int32x4_t, c2: int32x4_t, c3: int32x4_t) {
+            let va = vdupq_n_f32(sa);
+            vst1q_f32(o, vmulq_f32(vcvtq_f32_s32(c0), vmulq_f32(vld1q_f32(s), va)));
+            vst1q_f32(o.add(4), vmulq_f32(vcvtq_f32_s32(c1), vmulq_f32(vld1q_f32(s.add(4)), va)));
+            vst1q_f32(o.add(8), vmulq_f32(vcvtq_f32_s32(c2), vmulq_f32(vld1q_f32(s.add(8)), va)));
+            vst1q_f32(o.add(12), vmulq_f32(vcvtq_f32_s32(c3), vmulq_f32(vld1q_f32(s.add(12)), va)));
+        }
+
+        let mut row = 0usize;
+        while row + 4 <= m {
+            let a0 = a_ptr.add(row * k);
+            let a1 = a_ptr.add((row + 1) * k);
+            let a2 = a_ptr.add((row + 2) * k);
+            let a3 = a_ptr.add((row + 3) * k);
+            for blk in 0..num_blocks {
+                let z = vdupq_n_s32(0);
+                let (mut c00, mut c01, mut c02, mut c03) = (z, z, z, z);
+                let (mut c10, mut c11, mut c12, mut c13) = (z, z, z, z);
+                let (mut c20, mut c21, mut c22, mut c23) = (z, z, z, z);
+                let (mut c30, mut c31, mut c32, mut c33) = (z, z, z, z);
+                let mut p = b_ptr.add(blk * k_groups * 64);
+                for k4 in 0..k_groups {
+                    let w0 = vld1q_s8(p);
+                    let w1 = vld1q_s8(p.add(16));
+                    let w2 = vld1q_s8(p.add(32));
+                    let w3 = vld1q_s8(p.add(48));
+                    let x0 = bcast4(a0.add(k4 * 4));
+                    c00 = vdotq_s32(c00, w0, x0);
+                    c01 = vdotq_s32(c01, w1, x0);
+                    c02 = vdotq_s32(c02, w2, x0);
+                    c03 = vdotq_s32(c03, w3, x0);
+                    let x1 = bcast4(a1.add(k4 * 4));
+                    c10 = vdotq_s32(c10, w0, x1);
+                    c11 = vdotq_s32(c11, w1, x1);
+                    c12 = vdotq_s32(c12, w2, x1);
+                    c13 = vdotq_s32(c13, w3, x1);
+                    let x2 = bcast4(a2.add(k4 * 4));
+                    c20 = vdotq_s32(c20, w0, x2);
+                    c21 = vdotq_s32(c21, w1, x2);
+                    c22 = vdotq_s32(c22, w2, x2);
+                    c23 = vdotq_s32(c23, w3, x2);
+                    let x3 = bcast4(a3.add(k4 * 4));
+                    c30 = vdotq_s32(c30, w0, x3);
+                    c31 = vdotq_s32(c31, w1, x3);
+                    c32 = vdotq_s32(c32, w2, x3);
+                    c33 = vdotq_s32(c33, w3, x3);
+                    p = p.add(64);
+                }
+                let col = blk * 16;
+                let s = s_ptr.add(col);
+                store_scaled(o_ptr.add(row * out_dim + col), s, sc.a_scales[row], c00, c01, c02, c03);
+                store_scaled(o_ptr.add((row + 1) * out_dim + col), s, sc.a_scales[row + 1], c10, c11, c12, c13);
+                store_scaled(o_ptr.add((row + 2) * out_dim + col), s, sc.a_scales[row + 2], c20, c21, c22, c23);
+                store_scaled(o_ptr.add((row + 3) * out_dim + col), s, sc.a_scales[row + 3], c30, c31, c32, c33);
+            }
+            row += 4;
+        }
+        while row < m {
+            let a0 = a_ptr.add(row * k);
+            for blk in 0..num_blocks {
+                let z = vdupq_n_s32(0);
+                let (mut c0, mut c1, mut c2, mut c3) = (z, z, z, z);
+                let mut p = b_ptr.add(blk * k_groups * 64);
+                for k4 in 0..k_groups {
+                    let x = bcast4(a0.add(k4 * 4));
+                    c0 = vdotq_s32(c0, vld1q_s8(p), x);
+                    c1 = vdotq_s32(c1, vld1q_s8(p.add(16)), x);
+                    c2 = vdotq_s32(c2, vld1q_s8(p.add(32)), x);
+                    c3 = vdotq_s32(c3, vld1q_s8(p.add(48)), x);
+                    p = p.add(64);
+                }
+                let col = blk * 16;
+                store_scaled(o_ptr.add(row * out_dim + col), s_ptr.add(col), sc.a_scales[row], c0, c1, c2, c3);
+            }
+            row += 1;
+        }
+    });
+}
+
 pub fn gemm_packed(a: &[f32], m: usize, k: usize, b: &PackedMatrix, out: &mut [f32]) {
     assert_eq!(k, b.in_dim);
     assert_eq!(a.len(), m * k);
@@ -831,12 +1211,36 @@ pub fn gemm_packed(a: &[f32], m: usize, k: usize, b: &PackedMatrix, out: &mut [f
                     return;
                 }
             }
+            PackedPanels::I8Sdot { .. } => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match &b.panels {
+            PackedPanels::F32(panels) => {
+                // SAFETY: NEON is baseline on AArch64; slice bounds were asserted above.
+                unsafe {
+                    gemm_packed_f32_neon(a, m, k, panels, b.out_dim, out);
+                }
+                return;
+            }
+            PackedPanels::I8Sdot { panels, scales } => {
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    // SAFETY: `dotprod` detected at runtime; slice bounds were asserted above.
+                    unsafe {
+                        gemm_packed_i8_sdot(a, m, k, panels, scales, b.out_dim, out);
+                    }
+                    return;
+                }
+            }
+            PackedPanels::I8Vnni { .. } => {}
         }
     }
     gemm_packed_scalar(a, m, k, b, out);
 }
 
 #[inline]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }
@@ -877,10 +1281,106 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[inline]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn axpy_f32_scalar(dst: &mut [f32], alpha: f32, src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, &s) in dst.iter_mut().zip(src.iter()) {
         *d += alpha * s;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn axpy_f32_neon(dst: &mut [f32], alpha: f32, src: &[f32]) {
+    use std::arch::aarch64::*;
+
+    let len = dst.len().min(src.len());
+    let dp = dst.as_mut_ptr();
+    let sp = src.as_ptr();
+    let va = vdupq_n_f32(alpha);
+    let mut i = 0usize;
+    while i + 8 <= len {
+        vst1q_f32(dp.add(i), vfmaq_f32(vld1q_f32(dp.add(i)), vld1q_f32(sp.add(i)), va));
+        vst1q_f32(dp.add(i + 4), vfmaq_f32(vld1q_f32(dp.add(i + 4)), vld1q_f32(sp.add(i + 4)), va));
+        i += 8;
+    }
+    while i < len {
+        *dp.add(i) += alpha * *sp.add(i);
+        i += 1;
+    }
+}
+
+/// Portable dot product used by the non-AVX2 code paths (NEON on AArch64).
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on AArch64; the kernel bounds itself by the shorter slice.
+        unsafe { dot_f32_neon(a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f32_scalar(a, b)
+    }
+}
+
+/// Portable `dst += alpha * src` used by the non-AVX2 code paths (NEON on AArch64).
+#[inline]
+fn axpy_f32(dst: &mut [f32], alpha: f32, src: &[f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on AArch64; the kernel bounds itself by the shorter slice.
+        unsafe { axpy_f32_neon(dst, alpha, src) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        axpy_f32_scalar(dst, alpha, src)
+    }
+}
+
+/// NEON port of `fast_exp_ps_avx2` (same range reduction and polynomial).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0)), vdupq_n_f32(88.0));
+    let n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(1.44269504)));
+    let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0.693145751953125)), n, vdupq_n_f32(1.4286068203094172e-6));
+    let one = vdupq_n_f32(1.0);
+    let mut p = vfmaq_f32(vdupq_n_f32(0.008333334), vdupq_n_f32(0.0013888889), r);
+    p = vfmaq_f32(vdupq_n_f32(0.041666668), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.16666667), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.5), p, r);
+    p = vfmaq_f32(one, p, r);
+    p = vfmaq_f32(one, p, r);
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127))));
+    vmulq_f32(p, pow2n)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn swiglu_batch_neon(gate_up: &[f32], n_nodes: usize, d_ff: usize, act: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let gu_ptr = gate_up.as_ptr();
+    let act_ptr = act.as_mut_ptr();
+    let one = vdupq_n_f32(1.0);
+    for u in 0..n_nodes {
+        let gate = gu_ptr.add(u * 2 * d_ff);
+        let up = gate.add(d_ff);
+        let dst = act_ptr.add(u * d_ff);
+        let mut j = 0usize;
+        while j + 4 <= d_ff {
+            let g = vld1q_f32(gate.add(j));
+            let silu = vdivq_f32(g, vaddq_f32(one, fast_exp_neon(vnegq_f32(g))));
+            vst1q_f32(dst.add(j), vmulq_f32(silu, vld1q_f32(up.add(j))));
+            j += 4;
+        }
+        while j < d_ff {
+            let g = *gate.add(j);
+            *dst.add(j) = g / (1.0_f32 + (-g).exp()) * *up.add(j);
+            j += 1;
+        }
     }
 }
 
@@ -1138,6 +1638,7 @@ unsafe fn swiglu_batch_avx2(gate_up: &[f32], n_nodes: usize, d_ff: usize, act: &
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(unreachable_code))]
 fn swiglu_batch(gate_up: &[f32], n_nodes: usize, d_ff: usize, act: &mut [f32], has_avx2: bool) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1148,6 +1649,15 @@ fn swiglu_batch(gate_up: &[f32], n_nodes: usize, d_ff: usize, act: &mut [f32], h
             }
             return;
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = has_avx2;
+        // SAFETY: NEON is baseline on AArch64; buffer sizes are the caller's `n_nodes x d_ff`.
+        unsafe {
+            swiglu_batch_neon(gate_up, n_nodes, d_ff, act);
+        }
+        return;
     }
     let _ = has_avx2;
     for u in 0..n_nodes {
@@ -1730,7 +2240,13 @@ impl Reranker {
                     dot_f32_scalar(hidden, emb)
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = has_avx2;
+                // SAFETY: NEON is baseline on AArch64; lengths are both d_model.
+                unsafe { dot_f32_neon(hidden, emb) }
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             {
                 let _ = has_avx2;
                 dot_f32_scalar(hidden, emb)
@@ -1843,7 +2359,7 @@ impl Reranker {
                 let mut max_s = f32::NEG_INFINITY;
                 for p in 0..cached_len {
                     let k_off = p * d + hd_off;
-                    let s = dot_f32_scalar(q_vec, &cached_k[k_off..k_off + self.head_dim]) * scale;
+                    let s = dot_f32(q_vec, &cached_k[k_off..k_off + self.head_dim]) * scale;
                     attn_scores[p] = s;
                     if s > max_s {
                         max_s = s;
@@ -1851,7 +2367,7 @@ impl Reranker {
                 }
                 for (idx, &anc) in chain.iter().enumerate() {
                     let k_off = anc * qkv_stride + d + hd_off;
-                    let s = dot_f32_scalar(q_vec, &qkv[k_off..k_off + self.head_dim]) * scale;
+                    let s = dot_f32(q_vec, &qkv[k_off..k_off + self.head_dim]) * scale;
                     attn_scores[cached_len + idx] = s;
                     if s > max_s {
                         max_s = s;
@@ -1869,12 +2385,12 @@ impl Reranker {
                 for p in 0..cached_len {
                     let w = attn_scores[p] * inv_sum;
                     let v_off = p * d + hd_off;
-                    axpy_f32_scalar(out_head, w, &cached_v[v_off..v_off + self.head_dim]);
+                    axpy_f32(out_head, w, &cached_v[v_off..v_off + self.head_dim]);
                 }
                 for (idx, &anc) in chain.iter().enumerate() {
                     let w = attn_scores[cached_len + idx] * inv_sum;
                     let v_off = anc * qkv_stride + 2 * d + hd_off;
-                    axpy_f32_scalar(out_head, w, &qkv[v_off..v_off + self.head_dim]);
+                    axpy_f32(out_head, w, &qkv[v_off..v_off + self.head_dim]);
                 }
             }
         }
@@ -2165,7 +2681,7 @@ fn rmsnorm_batch(
     for row in 0..n_rows {
         let src = &x[row * dim..(row + 1) * dim];
         let dst = &mut out[row * dim..(row + 1) * dim];
-        let sq_sum = dot_f32_scalar(src, src);
+        let sq_sum = dot_f32(src, src);
         let scale = 1.0_f32 / (sq_sum * inv_dim + 1e-6_f32).sqrt();
         for i in 0..dim {
             dst[i] = src[i] * scale * weight[i];
@@ -2611,6 +3127,41 @@ mod tests {
             norm_f,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn gemm_sdot_matches_reference_and_tracks_f32() {
+        let (m, k, n) = (7usize, 96usize, 48usize);
+        let mut seed = 0x5d07_u64;
+        let w: Vec<f32> = (0..n * k).map(|_| pseudo_rand(&mut seed)).collect();
+        let raw: Vec<u16> = w.iter().map(|&v| f32_to_f16(v)).collect();
+        let a: Vec<f32> = (0..m * k).map(|_| pseudo_rand(&mut seed)).collect();
+
+        let (panels, scales, _) = quantize_weight_panels_i8(&raw, n, k);
+        let q = PackedMatrix {
+            out_dim: n,
+            in_dim: k,
+            panels: PackedPanels::I8Sdot { panels, scales },
+        };
+        let f = PackedMatrix::from_row_major_f16_as_f32(&raw, n, k);
+
+        let mut reference = vec![0.0_f32; m * n];
+        gemm_packed_scalar(&a, m, k, &q, &mut reference);
+        let mut fast = vec![0.0_f32; m * n];
+        gemm_packed(&a, m, k, &q, &mut fast);
+        // Integer accumulation is exact: the SIMD kernel (where available) must match bit-for-bit.
+        for (x, y) in reference.iter().zip(&fast) {
+            assert_eq!(x.to_bits(), y.to_bits(), "{x} vs {y}");
+        }
+
+        let mut exact = vec![0.0_f32; m * n];
+        gemm_packed_scalar(&a, m, k, &f, &mut exact);
+        let peak = exact.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+        let max_err = exact
+            .iter()
+            .zip(&reference)
+            .fold(0.0_f32, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(max_err < 0.03 * peak, "int8 error {max_err} vs peak {peak}");
     }
 
     #[test]

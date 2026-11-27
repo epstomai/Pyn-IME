@@ -15,3 +15,6 @@ __pycache__/
 
 # Local agent workspace metadata
 /.antigravity/
+
+# Release packages (tools/release/package_release.py)
+/dist/

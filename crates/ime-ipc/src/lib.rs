@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod english;
+#[cfg(windows)]
 pub mod pipe;
 pub mod protocol;
 pub mod session;
@@ -9,8 +10,10 @@ pub mod session;
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(windows)]
     use std::thread;
 
+    #[cfg(windows)]
     use crate::pipe::{NamedPipeClient, NamedPipeServerInstance};
     use crate::protocol::{read_frame, write_frame, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
     use crate::session::{InputMode, KeyAction, KeyEvent, KeyModifiers, SessionController};
@@ -35,6 +38,7 @@ mod tests {
         assert!(read_frame::<_, IpcRequest>(&mut bad_cur).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn named_pipe_appcontainer_dacl_roundtrip() {
         let pipe_name = format!(r"\\.\pipe\PynTSF_unit_test_{}", std::process::id());

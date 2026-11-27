@@ -1,4 +1,5 @@
-//! Compact binary lexicon and Kneser-Ney trigram language model (`IMEMOD01`).
+//! Compact binary lexicon and Kneser-Ney trigram language model (`IMEMOD01`, or `IMEMOD02` with
+//! 8-bit codebook-quantized bigram/trigram tables for mobile; see `crate::slim`).
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -11,6 +12,9 @@ use crate::pinyin::{
 use crate::user_dict::PROTECTED_FUNCTION_WORDS;
 
 pub const MAGIC: &[u8; 8] = b"IMEMOD01";
+/// Same layout as `MAGIC`, but `bigram_logp`, `bigram_bow` and `trigram_logp` are stored as a
+/// 256-entry `f32` codebook followed by one `u8` code per value. Dequantized to `f32` on load.
+pub const MAGIC_Q8: &[u8; 8] = b"IMEMOD02";
 pub const BOS_ID: u32 = 0;
 pub const EOS_ID: u32 = 1;
 pub const PAUSE_ID: u32 = 2;
@@ -868,9 +872,25 @@ impl Model {
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.save_impl(path, false)
+    }
+
+    /// Save as `IMEMOD02` (8-bit quantized n-gram probabilities and back-off weights).
+    pub fn save_quantized(&self, path: &Path) -> io::Result<()> {
+        self.save_impl(path, true)
+    }
+
+    fn save_impl(&self, path: &Path, quantized: bool) -> io::Result<()> {
         let file = File::create(path)?;
         let mut w = BufWriter::new(file);
-        w.write_all(MAGIC)?;
+        w.write_all(if quantized { MAGIC_Q8 } else { MAGIC })?;
+        let write_probs = |w: &mut BufWriter<File>, s: &[f32]| {
+            if quantized {
+                write_q8_slice(w, s)
+            } else {
+                write_f32_slice(w, s)
+            }
+        };
         write_u32(&mut w, self.num_words() as u32)?;
         write_u32(&mut w, self.word_bytes.len() as u32)?;
         write_u32(&mut w, self.bigram_w2.len() as u32)?;
@@ -894,12 +914,12 @@ impl Model {
 
         write_u32_slice(&mut w, &self.bigram_offsets)?;
         write_u32_slice(&mut w, &self.bigram_w2)?;
-        write_f32_slice(&mut w, &self.bigram_logp)?;
-        write_f32_slice(&mut w, &self.bigram_bow)?;
+        write_probs(&mut w, &self.bigram_logp)?;
+        write_probs(&mut w, &self.bigram_bow)?;
 
         write_u32_slice(&mut w, &self.trigram_offsets)?;
         write_u32_slice(&mut w, &self.trigram_w3)?;
-        write_f32_slice(&mut w, &self.trigram_logp)?;
+        write_probs(&mut w, &self.trigram_logp)?;
         w.flush()
     }
 
@@ -908,12 +928,23 @@ impl Model {
         let mut r = BufReader::with_capacity(1 << 20, file);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        let quantized = if &magic == MAGIC {
+            false
+        } else if &magic == MAGIC_Q8 {
+            true
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid model magic header",
             ));
-        }
+        };
+        let read_probs = |r: &mut BufReader<File>, len: usize| {
+            if quantized {
+                read_q8_vec(r, len)
+            } else {
+                read_f32_vec(r, len)
+            }
+        };
 
         let num_words = read_u32(&mut r)? as usize;
         let word_bytes_len = read_u32(&mut r)? as usize;
@@ -937,12 +968,12 @@ impl Model {
 
         let bigram_offsets = read_u32_vec(&mut r, num_words + 1)?;
         let bigram_w2 = read_u32_vec(&mut r, num_bigrams)?;
-        let bigram_logp = read_f32_vec(&mut r, num_bigrams)?;
-        let bigram_bow = read_f32_vec(&mut r, num_bigrams)?;
+        let bigram_logp = read_probs(&mut r, num_bigrams)?;
+        let bigram_bow = read_probs(&mut r, num_bigrams)?;
 
         let trigram_offsets = read_u32_vec(&mut r, num_bigrams + 1)?;
         let trigram_w3 = read_u32_vec(&mut r, num_trigrams)?;
-        let trigram_logp = read_f32_vec(&mut r, num_trigrams)?;
+        let trigram_logp = read_probs(&mut r, num_trigrams)?;
 
         Ok(Self::from_parts(
             word_offsets,
@@ -1090,30 +1121,79 @@ fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
 }
 
 fn read_u32_vec<R: Read>(r: &mut R, len: usize) -> io::Result<Vec<u32>> {
-    let mut raw = vec![0u8; len * 4];
-    r.read_exact(&mut raw)?;
-    Ok(raw
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    #[cfg(target_endian = "little")]
+    {
+        let mut out = vec![0u32; len];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, len * 4)
+        };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut raw = vec![0u8; len * 4];
+        r.read_exact(&mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
 }
 
 fn read_u64_vec<R: Read>(r: &mut R, len: usize) -> io::Result<Vec<u64>> {
-    let mut raw = vec![0u8; len * 8];
-    r.read_exact(&mut raw)?;
-    Ok(raw
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect())
+    #[cfg(target_endian = "little")]
+    {
+        let mut out = vec![0u64; len];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, len * 8)
+        };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut raw = vec![0u8; len * 8];
+        r.read_exact(&mut raw)?;
+        Ok(raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect())
+    }
 }
 
 fn read_f32_vec<R: Read>(r: &mut R, len: usize) -> io::Result<Vec<f32>> {
-    let mut raw = vec![0u8; len * 4];
-    r.read_exact(&mut raw)?;
-    Ok(raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    #[cfg(target_endian = "little")]
+    {
+        let mut out = vec![0.0_f32; len];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, len * 4)
+        };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut raw = vec![0u8; len * 4];
+        r.read_exact(&mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+}
+
+fn write_q8_slice<W: Write>(w: &mut W, s: &[f32]) -> io::Result<()> {
+    let (codebook, codes) = crate::slim::quantize_q8(s);
+    write_f32_slice(w, &codebook)?;
+    w.write_all(&codes)
+}
+
+fn read_q8_vec<R: Read>(r: &mut R, len: usize) -> io::Result<Vec<f32>> {
+    let codebook = read_f32_vec(r, crate::slim::Q8_LEVELS)?;
+    let mut codes = vec![0u8; len];
+    r.read_exact(&mut codes)?;
+    Ok(codes.iter().map(|&c| codebook[c as usize]).collect())
 }
 
 fn read_lex_entries<R: Read>(r: &mut R, len: usize) -> io::Result<Vec<LexEntry>> {

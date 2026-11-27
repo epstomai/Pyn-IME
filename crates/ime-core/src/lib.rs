@@ -8,6 +8,7 @@ pub mod domain;
 pub mod model;
 pub mod pinyin;
 pub mod reranker;
+pub mod slim;
 pub mod user_dict;
 
 use std::path::Path;
@@ -494,6 +495,38 @@ mod tests {
         assert!(haod.edges_from[3]
             .iter()
             .any(|e| matches!(e.kind, DagEdgeKind::Abbrev(_))));
+    }
+
+    #[test]
+    fn slim_prune_and_q8_roundtrip_keep_decoding() {
+        let model = make_toy_model();
+
+        // Generous budgets keep everything; zero trigram budget drops the only trigram.
+        let (same, rep) = crate::slim::prune_model(&model, usize::MAX, usize::MAX, f64::INFINITY);
+        assert_eq!(rep.bigrams_after, model.bigram_w2.len());
+        assert_eq!(rep.trigrams_after, model.trigram_w3.len());
+        assert_eq!(same.bigram_logp, model.bigram_logp);
+        let (pruned, rep) = crate::slim::prune_model(&model, model.bigram_w2.len() - 2, 0, 1.0);
+        assert_eq!(rep.trigrams_after, 0);
+        assert_eq!(rep.bigrams_after, model.bigram_w2.len() - 2);
+        assert_eq!(pruned.trigram_offsets.len(), pruned.bigram_w2.len() + 1);
+        assert!(pruned.bigram_bow.iter().chain(&pruned.unigram_bow).all(|v| v.is_finite()));
+
+        let tmp = std::env::temp_dir().join("ime_core_q8_roundtrip_test.bin");
+        model.save_quantized(&tmp).unwrap();
+        let loaded = Model::load(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(loaded.bigram_w2, model.bigram_w2);
+        assert_eq!(loaded.trigram_w3, model.trigram_w3);
+        for (a, b) in loaded.bigram_logp.iter().zip(&model.bigram_logp) {
+            assert!((a - b).abs() < 0.05, "{a} vs {b}");
+        }
+
+        let mut full = Engine::with_model(Arc::new(model));
+        let mut q8 = Engine::with_model(Arc::new(loaded));
+        for keys in ["xian", "le", "haod", "kuaile"] {
+            assert_eq!(full.convert(keys, 5), q8.convert(keys, 5), "keys={keys}");
+        }
     }
 
     #[test]

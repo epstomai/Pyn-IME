@@ -144,6 +144,9 @@ struct RawHyp {
     span_start: u16,
     span_end: u16,
     pron: SpanPron,
+    /// Position in the raw list, assigned by `prune_beam`: the final tie-break that lets unstable
+    /// sorts reproduce the former stable-sort order exactly.
+    seq: u32,
 }
 
 impl RawHyp {
@@ -1077,6 +1080,7 @@ fn run_beam_search(
                                 span_start: span.start as u16,
                                 span_end: end as u16,
                                 pron: span.pron,
+                                seq: 0,
                             });
                         }
                     }
@@ -1118,6 +1122,7 @@ fn run_beam_search(
                                         span_start: 0,
                                         span_end: end as u16,
                                         pron: span.pron,
+                                        seq: 0,
                                     });
                                 }
                             }
@@ -1146,6 +1151,7 @@ fn run_beam_search(
                             span_start: span.start as u16,
                             span_end: end as u16,
                             pron: span.pron,
+                            seq: 0,
                         });
                     }
                 }
@@ -2237,11 +2243,17 @@ fn prune_beam(
         return Vec::new();
     }
 
-    // Group by (h1, h2) keeping up to `max_per_state` distinct texts per LM state.
-    raw.sort_by(|a, b| {
+    // Group by (h1, h2) keeping up to `max_per_state` distinct texts per LM state. The original
+    // position is the last key, so this unstable sort reproduces the former stable sort exactly
+    // without its merge buffer.
+    for (i, rh) in raw.iter_mut().enumerate() {
+        rh.seq = i as u32;
+    }
+    raw.sort_unstable_by(|a, b| {
         (a.h1, a.h2)
             .cmp(&(b.h1, b.h2))
             .then_with(|| b.total_score().total_cmp(&a.total_score()))
+            .then(a.seq.cmp(&b.seq))
     });
 
     scratch.kept_raw.clear();
@@ -2305,12 +2317,19 @@ fn prune_beam(
         }
     }
 
-    scratch
-        .kept_raw
-        .sort_by(|a, b| b.total_score().total_cmp(&a.total_score()));
+    // Best `beam_width` by score. `kept_raw` is ordered by (state, -score, seq), so for equal
+    // scores (h1, h2, seq) reproduces the former stable sort; select first, then order only the
+    // survivors.
+    let by_score = |a: &RawHyp, b: &RawHyp| {
+        b.total_score()
+            .total_cmp(&a.total_score())
+            .then((a.h1, a.h2, a.seq).cmp(&(b.h1, b.h2, b.seq)))
+    };
     if scratch.kept_raw.len() > beam_width {
+        scratch.kept_raw.select_nth_unstable_by(beam_width - 1, by_score);
         scratch.kept_raw.truncate(beam_width);
     }
+    scratch.kept_raw.sort_unstable_by(by_score);
 
     let mut kept = Vec::with_capacity(scratch.kept_raw.len());
     for &rh in &scratch.kept_raw {

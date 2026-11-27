@@ -1,0 +1,15 @@
+[package]
+name = "ime-android"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "pyn_ime"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ime-core = { path = "../ime-core" }
+ime-ipc = { path = "../ime-ipc" }
+jni = "0.21"
+serde.workspace = true
+serde_json.workspace = true

@@ -22,6 +22,10 @@ n-gram 实时解码加小型神经网络重排。
 | `crates/ime-cli` | 命令行前端：`--jsonl` / `--interactive` 交互试打，支持 `--reranker`、`--cs-ai`、`--user-dict`、`--no-learn` 与 `:learn` / `:commit` |
 | `data/curated` | 人工审核的错词屏蔽表（`typo_banlist.txt`）、现代高频/CS 补词表（`modern_extra.tsv`）、可选 CS/AI 提权表（`cs_ai_boost.tsv`）与错字最小对（`confusable_pairs.tsv`） |
 | `tools/windows` | Windows TSF x64/x86 双架构部署、代际版本化零重启热切换、ACL 授权与 `System32`/`SysWOW64` `regsvr32` 注册/卸载脚本（`install_tsf.py`） |
+| `crates/ime-android` | Android JNI 引擎封装（`libpyn_ime.so`，arm64 NEON / `sdot` 重排内核，连续按键延迟解码） |
+| `android` | Android 26 键输入法 App（`com.pyn.ime`，后台引擎线程、候选栏 / 全屏候选、上滑数字符号） |
+| `tools/android` | 精简模型生成、`cargo ndk` 构建与 APK 安装脚本（`build_install.py`） |
+| `tools/release` | GitHub 发布包打包脚本（`package_release.py`：Windows zip + Android APK） |
 | `tools/train` | 开放语料清洗脚本、`curate_lexicon.py` 词表净化及神经重排两阶段 GPU 训练脚本（`prepare_corpus.py` / `train_reranker.py` / `finetune_reranker_s2.py`） |
 | `tools/evalkit` | 评测集构建脚本、评测器、Rime 基线适配与 `check_cs_domain.py` 领域 A/B 检查 |
 | `eval/src` | 手写的评测源文件 |
@@ -66,6 +70,32 @@ cargo build -p ime-tsf --release --target i686-pc-windows-msvc
 .venv/Scripts/python tools/windows/install_tsf.py settings
 # 卸载：.venv/Scripts/python tools/windows/install_tsf.py unregister
 ```
+
+## 移动端精简模型
+
+Android 版不打包 173 MB 的全量模型，而是由 `ime-slim` 从全量模型离线生成 `models/ime_model_mobile.bin`（`IMEMOD02`，约 48 MB），APK 内仍以 `ime_model.bin` 名义分发：
+
+- **相对熵（Stolcke）剪枝**：二元 / 三元各保留 250 万（全量各 700 万），按删除代价最小的顺序裁剪，回退权重随剪枝同步重算；
+- **虚词 / 句尾保护**：预测 `</s>` 或受保护虚词（`的/地/得/了/着/过/吗/呢/吧/啊/呀/啦/嘛/哦/么`）的 n-gram 删除代价 ×5，守住语气词与结构助词门禁；
+- **8 位码本量化**：二元 / 三元概率与回退权重以 256 级 Lloyd-Max 码本存盘（精确 0 值单独编码），加载时还原为 `f32`，解码热路径与桌面端不变。
+
+与全量模型对比（同一 `reranker.bin`）：`general` heldout `76.89%`（持平）、`function_words` all `93.87%`（全量 `93.31%`）、`incremental` all `91.99%`（全量 `91.88%`），全部门禁 `0` 失败、污染基线 `830 / 830`、`13` 个场景 `0` 回归。真机（arm64）冷加载约 `0.17 s`，Native Heap 约 `104 MB`（全量 `208 MB`），APK `57.6 MB`（原 `182 MB`）。
+
+```
+cargo build --release -p ime-train --bin ime-slim
+target/release/ime-slim.exe --in models/ime_model.bin --out models/ime_model_mobile.bin --max-bigrams 2.5M --max-trigrams 2.5M --protect-weight 5
+# 或直接：.venv/Scripts/python tools/android/build_install.py --install（全量模型更新后自动重新生成）
+```
+
+## 发布包
+
+```bash
+# 生成 dist/Pyn-<版本>-windows.zip、dist/Pyn-<版本>-android-arm64.apk 与 SHA256SUMS.txt
+.venv/Scripts/python tools/release/package_release.py
+```
+
+- **Windows**：TSF（x64 + x86）、`ime-server`、`ime-settings` 以静态 CRT 链接（无需 VC++ 运行库），构建于独立的 `target/dist`；压缩包附带 `install.cmd` / `uninstall.cmd`（`tools/windows/release/`），无需 Python，自动请求管理员权限完成注册、AppContainer 授权、开机自启与开始菜单“Pyn 设置”快捷方式；
+- **Android**：非 debuggable 的 release APK（arm64-v8a，内置精简模型），签名密钥取自 `PYN_KEYSTORE` / `PYN_KEYSTORE_PASS` / `PYN_KEY_ALIAS` / `PYN_KEY_PASS`，未设置时使用本机 Android debug 密钥（可直接覆盖 `build_install.py` 安装的开发版）。
 
 ## 数据来源与许可
 

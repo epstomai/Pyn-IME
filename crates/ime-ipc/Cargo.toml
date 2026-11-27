@@ -6,9 +6,11 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
 windows-core.workspace = true
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [
     "Win32_Foundation",

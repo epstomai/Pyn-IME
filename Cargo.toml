@@ -8,6 +8,7 @@ members = [
     "crates/ime-server",
     "crates/ime-tsf",
     "crates/ime-settings",
+    "crates/ime-android",
 ]
 
 [workspace.package]

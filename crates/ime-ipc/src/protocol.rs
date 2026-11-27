@@ -39,6 +39,23 @@ pub enum IpcRequest {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireCandidateKind {
+    #[default]
+    Full,
+    PrefixWord,
+    PrefixChar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireCandidate {
+    pub text: String,
+    pub consumed_len: usize,
+    #[serde(default)]
+    pub kind: WireCandidateKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IpcResponse {
@@ -53,6 +70,14 @@ pub enum IpcResponse {
         latency_ms: f32,
         #[serde(default)]
         config_revision: u64,
+        #[serde(default)]
+        items: Vec<WireCandidate>,
+        #[serde(default)]
+        segmented_preedit: Option<String>,
+        #[serde(default)]
+        first_char_offset: Option<usize>,
+        #[serde(default)]
+        first_syllable_len: usize,
     },
     Config {
         config: crate::config::ImeConfig,

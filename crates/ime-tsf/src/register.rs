@@ -18,11 +18,13 @@ use windows::Win32::UI::TextServices::{
     GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
     GUID_TFCAT_TIPCAP_SECUREMODE, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
     GUID_TFCAT_TIPCAP_UIELEMENTENABLED, GUID_TFCAT_TIP_KEYBOARD, ITfCategoryMgr,
-    ITfInputProcessorProfileMgr, ITfThreadMgr, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
-    TF_IPPMF_ENABLEPROFILE, TF_IPPMF_FORSESSION, TF_PROFILETYPE_INPUTPROCESSOR,
+    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, ITfThreadMgr,
+    TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_ENABLEPROFILE, TF_IPPMF_FORSESSION,
+    TF_PROFILETYPE_INPUTPROCESSOR,
 };
-use windows_core::{Error, GUID, HRESULT, PCWSTR};
+use windows_core::{Error, GUID, HRESULT, Interface, PCWSTR};
 
+use crate::debug_log::{refresh_enabled, tsf_log};
 use crate::globals::dll_module_path;
 use crate::guids::{active_guids, guid_to_braced_string, LANGID_ZH_CN, TIP_DISPLAY_NAME};
 
@@ -145,11 +147,29 @@ impl Drop for ComScope {
     }
 }
 
+fn res_hr_u32<T>(res: &windows_core::Result<T>) -> u32 {
+    match res {
+        Ok(_) => 0,
+        Err(e) => e.code().0 as u32,
+    }
+}
+
 pub fn register_server() -> windows_core::Result<()> {
+    refresh_enabled();
     let g = active_guids();
+    let clsid_str = guid_to_braced_string(&g.clsid);
     let dll_path = dll_module_path().ok_or_else(|| Error::from(E_FAIL))?;
     let dll_str = dll_path.to_string_lossy();
-    write_clsid_registry(&g.clsid, &dll_str)?;
+    let clsid_res = write_clsid_registry(&g.clsid, &dll_str);
+    if let Err(e) = &clsid_res {
+        tsf_log!(
+            "register",
+            "register_server clsid={} write_clsid hr=0x{:08x}",
+            clsid_str,
+            e.code().0 as u32
+        );
+    }
+    clsid_res?;
 
     let _com = ComScope::enter()?;
 
@@ -160,7 +180,7 @@ pub fn register_server() -> windows_core::Result<()> {
     let icon_w: Vec<u16> = dll_str.encode_utf16().collect();
     // Note: RegisterProfile expects TF_RP_* flags (0 = persistent HKLM LanguageProfile).
     // Passing TF_IPP_CAPS_UIELEMENTENABLED (0x4) collides with TF_RP_LOCALPROCESS and suppresses HKLM persistence.
-    unsafe {
+    let reg_prof_res = unsafe {
         profile_mgr.RegisterProfile(
             &g.clsid,
             LANGID_ZH_CN,
@@ -172,35 +192,116 @@ pub fn register_server() -> windows_core::Result<()> {
             0,
             true,
             0,
-        )?;
+        )
+    };
+    let reg_prof_hr = res_hr_u32(&reg_prof_res);
+    if reg_prof_res.is_err() {
+        tsf_log!(
+            "register",
+            "register_server clsid={} RegisterProfile hr=0x{:08x}",
+            clsid_str,
+            reg_prof_hr
+        );
     }
+    reg_prof_res?;
 
     let cat_mgr: ITfCategoryMgr =
         unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
     for &cat in &CATEGORIES {
-        unsafe {
-            cat_mgr.RegisterCategory(&g.clsid, cat, &g.clsid)?;
+        let r = unsafe { cat_mgr.RegisterCategory(&g.clsid, cat, &g.clsid) };
+        if let Err(e) = r {
+            let hr = e.code().0 as u32;
+            tsf_log!(
+                "register",
+                "register_server clsid={} RegisterCategory({}) hr=0x{:08x}",
+                clsid_str,
+                guid_to_braced_string(cat),
+                hr
+            );
+            return Err(e);
         }
     }
+    tsf_log!(
+        "register",
+        "register_server clsid={} profile_hr=0x{:08x} cats_hr=0x00000000",
+        clsid_str,
+        reg_prof_hr
+    );
     Ok(())
 }
 
 pub fn activate_profile_for_session() -> windows_core::Result<()> {
+    refresh_enabled();
     let g = active_guids();
+    let clsid_str = guid_to_braced_string(&g.clsid);
     let _com = ComScope::enter()?;
 
     let tm_activated: Option<ITfThreadMgr> = unsafe {
-        CoCreateInstance::<_, ITfThreadMgr>(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
-            .ok()
-            .and_then(|tm| if tm.Activate().is_ok() { Some(tm) } else { None })
+        match CoCreateInstance::<_, ITfThreadMgr>(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) {
+            Ok(tm) => {
+                let act_res = tm.Activate();
+                tsf_log!(
+                    "activate",
+                    "tm.Activate clsid={} hr=0x{:08x}",
+                    clsid_str,
+                    res_hr_u32(&act_res)
+                );
+                if act_res.is_ok() {
+                    Some(tm)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                tsf_log!(
+                    "activate",
+                    "CoCreateInstance(ThreadMgr) clsid={} hr=0x{:08x}",
+                    clsid_str,
+                    e.code().0 as u32
+                );
+                None
+            }
+        }
     };
 
     let profile_mgr: ITfInputProcessorProfileMgr =
         unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)? };
 
+    match profile_mgr.cast::<ITfInputProcessorProfiles>() {
+        Ok(profiles) => {
+            let enable_res = unsafe {
+                profiles.EnableLanguageProfile(&g.clsid, LANGID_ZH_CN, &g.profile, true)
+            };
+            tsf_log!(
+                "activate",
+                "EnableLanguageProfile clsid={} hr=0x{:08x}",
+                clsid_str,
+                res_hr_u32(&enable_res)
+            );
+            let default_res = unsafe {
+                profiles.SetDefaultLanguageProfile(LANGID_ZH_CN, &g.clsid, &g.profile)
+            };
+            tsf_log!(
+                "activate",
+                "SetDefaultLanguageProfile clsid={} hr=0x{:08x}",
+                clsid_str,
+                res_hr_u32(&default_res)
+            );
+        }
+        Err(e) => {
+            tsf_log!(
+                "activate",
+                "cast(ITfInputProcessorProfiles) clsid={} hr=0x{:08x}",
+                clsid_str,
+                e.code().0 as u32
+            );
+        }
+    }
+
     let flag_attempts = [
         TF_IPPMF_FORSESSION | TF_IPPMF_ENABLEPROFILE | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
         TF_IPPMF_FORSESSION | TF_IPPMF_ENABLEPROFILE,
+        TF_IPPMF_FORSESSION | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
         TF_IPPMF_FORSESSION,
     ];
     let mut res = Ok(());
@@ -215,6 +316,13 @@ pub fn activate_profile_for_session() -> windows_core::Result<()> {
                 flags,
             )
         };
+        tsf_log!(
+            "activate",
+            "ActivateProfile clsid={} flags=0x{:08x} hr=0x{:08x}",
+            clsid_str,
+            flags,
+            res_hr_u32(&res)
+        );
         if res.is_ok() {
             break;
         }
@@ -229,17 +337,24 @@ pub fn activate_profile_for_session() -> windows_core::Result<()> {
 }
 
 pub fn unregister_server() -> windows_core::Result<()> {
+    refresh_enabled();
     let g = active_guids();
+    let clsid_str = guid_to_braced_string(&g.clsid);
     let _com = ComScope::enter()?;
+    let mut cat_err = 0u32;
     if let Ok(cat_mgr) =
         unsafe { CoCreateInstance::<_, ITfCategoryMgr>(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER) }
     {
         for &cat in &CATEGORIES {
             unsafe {
-                let _ = cat_mgr.UnregisterCategory(&g.clsid, cat, &g.clsid);
+                let r = cat_mgr.UnregisterCategory(&g.clsid, cat, &g.clsid);
+                if let Err(e) = r {
+                    cat_err = e.code().0 as u32;
+                }
             }
         }
     }
+    let mut prof_hr = 0u32;
     if let Ok(profile_mgr) = unsafe {
         CoCreateInstance::<_, ITfInputProcessorProfileMgr>(
             &CLSID_TF_InputProcessorProfiles,
@@ -247,10 +362,16 @@ pub fn unregister_server() -> windows_core::Result<()> {
             CLSCTX_INPROC_SERVER,
         )
     } {
-        unsafe {
-            let _ = profile_mgr.UnregisterProfile(&g.clsid, LANGID_ZH_CN, &g.profile, 0);
-        }
+        let r = unsafe { profile_mgr.UnregisterProfile(&g.clsid, LANGID_ZH_CN, &g.profile, 0) };
+        prof_hr = res_hr_u32(&r);
     }
     delete_clsid_registry(&g.clsid);
+    tsf_log!(
+        "register",
+        "unregister_server clsid={} profile_hr=0x{:08x} last_cat_hr=0x{:08x}",
+        clsid_str,
+        prof_hr,
+        cat_err
+    );
     Ok(())
 }

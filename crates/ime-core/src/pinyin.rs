@@ -198,8 +198,24 @@ pub struct DagEdge {
 #[derive(Debug, Clone)]
 pub struct PinyinDag {
     pub len: usize,
+    pub raw_len: usize,
     pub exact_only: bool,
     pub edges_from: Vec<Vec<DagEdge>>,
+    pub norm_byte_starts: Vec<usize>,
+}
+
+impl PinyinDag {
+    /// Maps normalized DAG position `pos` (`0..=self.len`) to consumed byte length in original `keys`,
+    /// skipping any `'` separators immediately following `pos`.
+    pub fn raw_consumed_len(&self, pos: usize) -> usize {
+        if pos == 0 {
+            0
+        } else if pos >= self.len {
+            self.raw_len
+        } else {
+            self.norm_byte_starts[pos]
+        }
+    }
 }
 
 /// Builds an ambiguous pinyin segmentation DAG for raw keystrokes.
@@ -207,11 +223,13 @@ pub struct PinyinDag {
 /// Whenever at least one full exact-syllable path reaches the end, `Abbrev` edges are omitted
 /// completely so abbreviated matches can never outrank exact pinyin.
 pub fn build_dag(keys: &str) -> PinyinDag {
-    let mut norm = Vec::with_capacity(keys.len());
-    let mut boundary_before = Vec::with_capacity(keys.len());
+    let raw_len = keys.len();
+    let mut norm = Vec::with_capacity(raw_len);
+    let mut norm_byte_starts = Vec::with_capacity(raw_len);
+    let mut boundary_before = Vec::with_capacity(raw_len);
     let mut pending_sep = false;
 
-    for &b in keys.as_bytes() {
+    for (byte_idx, &b) in keys.as_bytes().iter().enumerate() {
         if b == b'\'' {
             if !norm.is_empty() {
                 pending_sep = true;
@@ -220,13 +238,16 @@ pub fn build_dag(keys: &str) -> PinyinDag {
         }
         if b.is_ascii_alphabetic() {
             norm.push(b.to_ascii_lowercase());
+            norm_byte_starts.push(byte_idx);
             boundary_before.push(pending_sep);
             pending_sep = false;
         } else {
             return PinyinDag {
                 len: 0,
+                raw_len,
                 exact_only: true,
                 edges_from: Vec::new(),
+                norm_byte_starts: Vec::new(),
             };
         }
     }
@@ -235,8 +256,10 @@ pub fn build_dag(keys: &str) -> PinyinDag {
     if n == 0 {
         return PinyinDag {
             len: 0,
+            raw_len,
             exact_only: true,
             edges_from: Vec::new(),
+            norm_byte_starts: Vec::new(),
         };
     }
 
@@ -296,7 +319,9 @@ pub fn build_dag(keys: &str) -> PinyinDag {
 
     PinyinDag {
         len: n,
+        raw_len,
         exact_only,
         edges_from,
+        norm_byte_starts,
     }
 }

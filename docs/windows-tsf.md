@@ -10,7 +10,7 @@
 [目标应用 (记事本 / VS Code / Terminal / Edge / QQ)]       [配置界面 ime-settings.exe (452.0 KiB)]
         │  COM In-Process (ITfTextInputProcessorEx)                 │
         ▼                                                           │ GetConfig / SetConfig
-[ime_tsf_gNNNN.dll (643.0 KiB) / ime_tsf_x86_gNNNN.dll (533.5 KiB)] │ (实时推送 + 修订号同步)
+[ime_tsf.dll / ime_tsf_x86.dll]                                      │ (实时推送 + 修订号同步)
         │  轻量 TSF 外壳 + Vercel/Geist 横排/竖排悬浮候选窗           │
         └──────────────────────┬────────────────────────────────────┘
                                │ Win32 Named Pipe (\\.\pipe\PynTSF_v1)
@@ -29,10 +29,10 @@
 
 | 项目 | 标识 / 策略 |
 |---|---|
-| `CLSID_PYN_TIP` | 基准 `{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0101}`；代际版本化 `ime_tsf_gNNNN.dll` 自动派生 `{A94E2C1B-7D3F-4E8A-9B20-6C5F8A3DNNNN}` |
-| `GUID_PYN_PROFILE` | 基准 `{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0102}`；代际版本化自动派生 `{A94E2C1B-7D3F-4E8A-9B21-6C5F8A3DNNNN}` |
-| `GUID_DISPLAY_ATTR_INPUT` | 基准 `{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0103}`；代际版本化自动派生 `{A94E2C1B-7D3F-4E8A-9B22-6C5F8A3DNNNN}`（热键与窗口类同理独立） |
-| 零重启代际热切换 | `install_tsf.py deploy` 自动递增 `gNNNN`、`regsvr32` + `InstallLayoutOrTip` 启用新代际并卸载清理旧代际注册表键，仍被旧进程映射的过期 DLL 登记 `MOVEFILE_DELAY_UNTIL_REBOOT` 延迟删除，已打开应用无需重启即可加载新版 DLL |
+| `CLSID_PYN_TIP` | 固定稳定 CLSID `{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0101}`（对应 `ime_tsf.dll` / `ime_tsf_x86.dll`）；仅显式传入 `--hotswap-clsid` 时派生临时代际 `{A94E2C1B-7D3F-4E8A-9B20-6C5F8A3DNNNN}` |
+| `GUID_PYN_PROFILE` | 固定稳定 `{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0102}`；显式 `--hotswap-clsid` 时派生 `{A94E2C1B-7D3F-4E8A-9B21-6C5F8A3DNNNN}` |
+| `GUID_DISPLAY_ATTR_INPUT` | 固定稳定 `{A94E2C1B-7D3F-4E8A-9B12-6C5F8A3D0103}`；显式 `--hotswap-clsid` 时派生 `{A94E2C1B-7D3F-4E8A-9B22-6C5F8A3DNNNN}`（热键与窗口类同理） |
+| 稳定 CLSID 原地安全更新 | 默认 `install_tsf.py deploy` 保持固定稳定 CLSID（不换代、不删旧 CLSID），通过 SHA-256 比对跳过未变更的 TSF/COM 操作；若 TSF DLL 有更新则通过“旧文件改名 `.old.*` + `MOVEFILE_DELAY_UNTIL_REBOOT`”原地替换，确保长期驻留的 Chrome/Electron 进程不再因旧 CLSID 被卸载而掉进“已禁用 IME（×）”（开发调试需强制递增 CLSID 时可显式传 `--hotswap-clsid`） |
 | 语言标识 / 名称 | `0x0804` (`zh-CN`) / `Pyn 拼音` |
 | 注册类别（8 项） | `GUID_TFCAT_TIP_KEYBOARD`、`IMMERSIVESUPPORT`、`SYSTRAYSUPPORT`、`UIELEMENTENABLED`、`SECUREMODE`、`COMLESS`、`INPUTMODECOMPARTMENT`、`DISPLAYATTRIBUTEPROVIDER` |
 | 双架构 COM / WOW64 | 先以 `SysWOW64\regsvr32.exe` 注册 `ime_tsf_x86.dll` 写入 `WOW6432Node\...\CLSID`，再以 `System32\regsvr32.exe` 注册 `ime_tsf.dll`；兼容 32 位 QQ 与旧 Win32/CUAS 应用 |
@@ -56,10 +56,12 @@
 | 空闲（刚上屏中文候选后） | `Backspace` | 键事件放行让宿主应用删除误选文字，同时向 `ime-server` 发送 `Undo` 触发回滚与惩罚门槛 |
 | 组合态（中文模式下中途切英文） | 单击 `Shift`（`OnPreservedKey` + `OnTestKeyUp`/`OnKeyUp` + 丢 `KeyUp` 恢复） | **立即把当前输入的原始英文编码上屏到输入框，并切换为英文模式**（不写入中文自学习，隐藏候选窗并弹出 `英` 浮标），后续按键直出英文；带组合键与长按 repeat 保护 |
 | 组合态（大写驼峰 / 符号 / 小键盘 / CapsLock） | `Shift+A–Z` / `CapsLock A–Z` / `0` / `/` / `RawChar` 符号与小键盘键 | `UpperChar`（如 `NiloToon` 途中按 `Shift+T`）追加进当前编码并临时展示英文候选，退格删回纯小写立即恢复中文（不再放行造成前插错位）；`CapsLock` 字母与 `0`、`/`、`RawChar` 同步提交「已输入编码+符号」结束组合且不锁定英文模式 |
-| 组合态 | `a–z` / `'` / `Backspace` | 追加拼音（或英文字符）/ 音节分隔符 `'` / 回退编码；退空自动取消组合并隐藏候选窗 |
-| 组合态 | `Space` / `1–5` | 提交高亮候选或本页第 1–5 项（英文组合态下提交英文且不写入中文学习；首字母大写进入的英文组合提交后自动保持中文模式） |
-| 组合态 | `Enter` / `Escape` | `Enter` 提交原始编码（不记录学习）；`Escape` 清空组合并关闭候选窗 |
-| 组合态（横排候选窗） | `Left` / `Right` / `Up` / `Down` / `Tab` / `-` / `=` / `PageUp` / `PageDown` | 横排高亮光标移动或每页 `5` 项翻页 |
+| 组合态 | `a–z` / `'` / `Backspace` | 追加拼音（或英文字符）/ 音节分隔符 `'` / 回退编码；若已有分段锁定则优先撤销刚锁定的词段恢复对应拼音，否则退删字母直至取消组合 |
+| 组合态 | `Space` / `1–9` | 提交高亮候选或本页第 1–9 项：若选中的是**前缀词或首音节单字**，则原地**分段锁定**已选汉字并将剩余拼音交给后续解码，直到全部拼音消费完一次性合并上屏并记入完整整词自学习；英文组合态直接提交且不写入中文学习 |
+| 组合态（多字拆选提效） | `[` / `]` | **以词定字**：中文组合态下按 `[` 取当前高亮词的首字并锁定首音节，按 `]` 取当前高亮词的尾字并锁定该词跨度（剩余拼音继续选词；英文组合态直出 `[` / `]`） |
+| 组合态（多字拆选提效） | `Tab` | 在「完整级联视图（精简整句 + 前缀词 + 首音节单字）」与「首音节单字快选视图（页码标记 `字 1/N`）」之间一键切换；选中锁定或继续打字自动复位 |
+| 组合态 | `Enter` / `Escape` | `Enter` 提交「已锁定汉字 + 剩余原始编码」（不记录学习）；`Escape` 清空全部锁定段与组合并关闭候选窗 |
+| 组合态（横排候选窗） | `Left` / `Right` / `Up` / `Down` / `-` / `=` / `PageUp` / `PageDown` | 高亮光标移动或按页翻页（每页 `3–9` 项，默认 `5` 项） |
 | 组合态 | 中文可映射标点（如 `, . ? !`） | 中文组合时自动上屏「当前高亮候选 + 中文全角标点」并仅学习纯汉字；英文组合时直接提交「选中英文 + 半角英文标点」（不学习） |
 | 组合 / 空闲 | `Ctrl+*` / `Alt+*` / `Win+*` / 空闲 `CapsLock A–Z` | 不拦截，直通宿主应用（`CapsLock` 空闲直接直出英文，组合态安全顺序提交） |
 
@@ -83,17 +85,19 @@ rustup target add i686-pc-windows-msvc
 cargo build --release
 cargo build -p ime-tsf --release --target i686-pc-windows-msvc
 
-# 2. 部署 x64 + x86 产物到 C:\Program Files\Pyn（已注册时自动执行代际热切换，无需重启应用）、创建设置快捷方式并赋予 AppContainer ACL
+# 2. 部署 x64 + x86 产物到 C:\Program Files\Pyn（默认固定稳定 CLSID 原地安全更新；DLL 未变化时跳过 COM/TSF 操作）、创建设置快捷方式并赋予 AppContainer ACL
 .\.venv\Scripts\python tools\windows\install_tsf.py deploy
 
 # 3. 双架构注册 COM（WOW64 + x64）与 TSF 中文输入法配置
 .\.venv\Scripts\python tools\windows\install_tsf.py register
 
-# 4. 打开设置界面或启停/查看守护进程状态
+# 4. 打开设置界面、启停/查看状态与 TSF 诊断排障
 .\.venv\Scripts\python tools\windows\install_tsf.py settings
 .\.venv\Scripts\python tools\windows\install_tsf.py start
 .\.venv\Scripts\python tools\windows\install_tsf.py status
 .\.venv\Scripts\python tools\windows\install_tsf.py stop
+.\.venv\Scripts\python tools\windows\install_tsf.py diag
+.\.venv\Scripts\python tools\windows\install_tsf.py debug --on --tail 40
 
 # 5. 彻底卸载（关闭服务 + 双架构 regsvr32 /u 反注册，注意如浏览器/QQ已加载 DLL 需重启对应应用释放文件锁）
 .\.venv\Scripts\python tools\windows\install_tsf.py unregister

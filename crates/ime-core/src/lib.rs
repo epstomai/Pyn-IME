@@ -13,7 +13,7 @@ pub mod user_dict;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use decoder::DecoderConfig;
+pub use decoder::{CandidateItem, CandidateKind, DecoderConfig, RichDecodeOutcome};
 pub use model::Model;
 pub use reranker::Reranker;
 pub use user_dict::{LearnConfig, UserMemory, UserStats};
@@ -994,5 +994,208 @@ mod tests {
         engine.set_config(cfg);
         assert_eq!(engine.convert("xiecheng", 5).first().map(String::as_str), Some("协程"));
         assert_eq!(engine.convert("zheshiwode", 5).first().map(String::as_str), Some("这是我的"));
+    }
+
+    #[test]
+    fn rich_cascade_decoding_single_syllable_truncation_and_segment_learning() {
+        use crate::decoder::{decode_rich_with_user, CandidateKind};
+
+        // 1. raw_consumed_len accurately maps normalized positions past apostrophes.
+        let xi_an = build_dag("xi'an");
+        assert_eq!(xi_an.len, 4);
+        assert_eq!(xi_an.raw_len, 5);
+        assert_eq!(xi_an.raw_consumed_len(0), 0);
+        assert_eq!(xi_an.raw_consumed_len(2), 3); // "xi'"
+        assert_eq!(xi_an.raw_consumed_len(4), 5);
+
+        // 2. Build a toy model for 3-syllable cascade (`jialichuang` -> 嘉立创) + splittable single syllable (`jia`).
+        let mut words = vec![
+            "<bos>", "<eos>", "<pause>", "家", "假", "加", "嘉", "里", "力", "立", "床", "创",
+            "家里", "嘉利", "立创", "西", "安", "西安", "急", "啊", "急啊",
+        ];
+        // Add 26 extra `jia` single-char homophones beyond `max_span_exact_char = 24`.
+        let extra_jia: Vec<String> = (0..26)
+            .map(|i| char::from_u32(0x4E00 + i).unwrap().to_string())
+            .collect();
+        for w in &extra_jia {
+            words.push(w.as_str());
+        }
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        let mut word_bytes = Vec::new();
+        for w in &words {
+            word_offsets.push(word_bytes.len() as u32);
+            word_bytes.extend_from_slice(w.as_bytes());
+        }
+        word_offsets.push(word_bytes.len() as u32);
+
+        let n = words.len();
+        let mut unigram_logp = vec![-9.0_f32; n];
+        unigram_logp[EOS_ID as usize] = -2.0;
+        unigram_logp[PAUSE_ID as usize] = -2.5;
+        unigram_logp[3] = -2.0; // 家
+        unigram_logp[4] = -2.5; // 假
+        unigram_logp[5] = -2.8; // 加
+        unigram_logp[6] = -4.2; // 嘉
+        unigram_logp[7] = -2.0; // 里
+        unigram_logp[8] = -2.4; // 力
+        unigram_logp[9] = -3.0; // 立
+        unigram_logp[10] = -2.2; // 床
+        unigram_logp[11] = -2.8; // 创
+        unigram_logp[12] = -1.6; // 家里
+        unigram_logp[13] = -3.2; // 嘉利
+        unigram_logp[14] = -2.6; // 立创
+        unigram_logp[15] = -3.0; // 西
+        unigram_logp[16] = -3.2; // 安
+        unigram_logp[17] = -2.2; // 西安
+        unigram_logp[18] = -4.0; // 急
+        unigram_logp[19] = -3.5; // 啊
+        unigram_logp[20] = -6.0; // 急啊
+        for i in 21..n {
+            unigram_logp[i] = -7.0 - ((i - 21) as f32) * 0.05;
+        }
+        let unigram_bow = vec![-0.2_f32; n];
+
+        let jia = syllable_id("jia").unwrap();
+        let ji = syllable_id("ji").unwrap();
+        let a = syllable_id("a").unwrap();
+        let li = syllable_id("li").unwrap();
+        let chuang = syllable_id("chuang").unwrap();
+        let xi = syllable_id("xi").unwrap();
+        let an = syllable_id("an").unwrap();
+        let xian = syllable_id("xian").unwrap();
+
+        let mut pairs = vec![
+            (pack_exact(&[jia]).unwrap(), LexEntry { word_id: 3, reading_logp: 0.0 }),
+            (pack_exact(&[jia]).unwrap(), LexEntry { word_id: 4, reading_logp: -0.05 }),
+            (pack_exact(&[jia]).unwrap(), LexEntry { word_id: 5, reading_logp: -0.1 }),
+            (pack_exact(&[jia]).unwrap(), LexEntry { word_id: 6, reading_logp: -0.2 }),
+            (pack_exact(&[li]).unwrap(), LexEntry { word_id: 7, reading_logp: 0.0 }),
+            (pack_exact(&[li]).unwrap(), LexEntry { word_id: 8, reading_logp: -0.1 }),
+            (pack_exact(&[li]).unwrap(), LexEntry { word_id: 9, reading_logp: -0.15 }),
+            (pack_exact(&[chuang]).unwrap(), LexEntry { word_id: 10, reading_logp: 0.0 }),
+            (pack_exact(&[chuang]).unwrap(), LexEntry { word_id: 11, reading_logp: -0.1 }),
+            (pack_exact(&[jia, li]).unwrap(), LexEntry { word_id: 12, reading_logp: 0.0 }),
+            (pack_exact(&[jia, li]).unwrap(), LexEntry { word_id: 13, reading_logp: 0.0 }),
+            (pack_exact(&[li, chuang]).unwrap(), LexEntry { word_id: 14, reading_logp: 0.0 }),
+            (pack_exact(&[xi]).unwrap(), LexEntry { word_id: 15, reading_logp: 0.0 }),
+            (pack_exact(&[an]).unwrap(), LexEntry { word_id: 16, reading_logp: 0.0 }),
+            (pack_exact(&[xi, an]).unwrap(), LexEntry { word_id: 17, reading_logp: 0.0 }),
+            (pack_exact(&[xian]).unwrap(), LexEntry { word_id: 17, reading_logp: -10.0 }), // unused
+            (pack_exact(&[ji]).unwrap(), LexEntry { word_id: 18, reading_logp: 0.0 }),
+            (pack_exact(&[a]).unwrap(), LexEntry { word_id: 19, reading_logp: 0.0 }),
+            (pack_exact(&[ji, a]).unwrap(), LexEntry { word_id: 20, reading_logp: 0.0 }),
+        ];
+        // Remove the unused fake xian entry above and keep real xian single char + xi+an word.
+        pairs.retain(|p| p.1.word_id != 17 || p.0 != pack_exact(&[xian]).unwrap());
+        pairs.push((pack_exact(&[xian]).unwrap(), LexEntry { word_id: 15, reading_logp: -0.1 }));
+        for i in 21..n {
+            pairs.push((
+                pack_exact(&[jia]).unwrap(),
+                LexEntry {
+                    word_id: i as u32,
+                    reading_logp: -0.3 - ((i - 21) as f32) * 0.01,
+                },
+            ));
+        }
+
+        let exact = build_lex_table(pairs.into_iter());
+        let initial_chars: [Vec<LexEntry>; 26] = std::array::from_fn(|_| Vec::new());
+        let empty_lex = LexTable::default();
+
+        let mut bigram_offsets = vec![0u32; n + 1];
+        let mut bigram_w2 = Vec::new();
+        let mut bigram_logp = Vec::new();
+        let mut bigram_bow = Vec::new();
+        for w1 in 0..n {
+            bigram_offsets[w1] = bigram_w2.len() as u32;
+            match w1 {
+                0 => {
+                    bigram_w2.extend_from_slice(&[12, 13, 17]);
+                    bigram_logp.extend_from_slice(&[-1.2, -2.5, -1.5]);
+                    bigram_bow.extend_from_slice(&[-0.1; 3]);
+                }
+                6 => {
+                    // After 嘉, 立创 is stronger than 里床
+                    bigram_w2.push(14);
+                    bigram_logp.push(-1.0);
+                    bigram_bow.push(-0.1);
+                }
+                10 | 11 | 14 | 17 => {
+                    bigram_w2.push(EOS_ID);
+                    bigram_logp.push(-0.2);
+                    bigram_bow.push(-0.1);
+                }
+                12 => {
+                    bigram_w2.extend_from_slice(&[10, 11]);
+                    bigram_logp.extend_from_slice(&[-1.0, -1.5]);
+                    bigram_bow.push(-0.1);
+                    bigram_bow.push(-0.1);
+                }
+                _ => {}
+            }
+        }
+        bigram_offsets[n] = bigram_w2.len() as u32;
+        let trigram_offsets = vec![0u32; bigram_w2.len() + 1];
+
+        let model = Arc::new(Model::from_parts(
+            word_offsets,
+            word_bytes,
+            unigram_logp,
+            unigram_bow,
+            exact,
+            initial_chars,
+            empty_lex.clone(),
+            empty_lex,
+            bigram_offsets,
+            bigram_w2,
+            bigram_logp,
+            bigram_bow,
+            trigram_offsets,
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let cfg = DecoderConfig::default();
+
+        // A. Single-syllable splittable `jia` returns ALL 30 single chars (>24) and keeps genuine lexicon word `急啊`?
+        // Wait: `急啊` IS in exact([ji, a]), while synthetic `急`+`啊` isn't added twice; verify >24 single chars appear.
+        let jia_out = decode_rich_with_user(&model, None, None, "jia", "", 200, &cfg);
+        assert!(jia_out.items.len() >= 30, "expected >= 30 items for jia, got {}", jia_out.items.len());
+        assert!(jia_out.items.iter().any(|it| it.text == "嘉"));
+
+        // `xian` keeps genuine lexicon word `西安` AND single char `西`.
+        let xian_out = decode_rich_with_user(&model, None, None, "xian", "", 50, &cfg);
+        assert!(xian_out.items.iter().any(|it| it.text == "西安"));
+        assert!(xian_out.items.iter().any(|it| it.text == "西"));
+
+        // B. `jialichuang` cascade: concise full (<=2 since no 3-char word), prefix words (`家里`/`嘉利`), then all `jia` single chars (`嘉`).
+        let jlc_out = decode_rich_with_user(&model, None, None, "jialichuang", "", 250, &cfg);
+        assert_eq!(jlc_out.segmented_preedit, "jia'li'chuang");
+        assert_eq!(jlc_out.first_syllable_len, 3);
+        let full_cnt = jlc_out.items.iter().filter(|it| it.kind == CandidateKind::Full).count();
+        assert!(full_cnt <= 2);
+        let prefix_words: Vec<&str> = jlc_out
+            .items
+            .iter()
+            .filter(|it| it.kind == CandidateKind::PrefixWord)
+            .map(|it| it.text.as_str())
+            .collect();
+        assert!(prefix_words.contains(&"家里"));
+        assert!(prefix_words.contains(&"嘉利"));
+        let char_off = jlc_out.first_char_offset.expect("first_char_offset present");
+        assert!(jlc_out.items[char_off..].iter().any(|it| it.text == "嘉" && it.consumed_len == 3));
+
+        // C. Lock `嘉` -> decode `lichuang` with context `嘉` -> `立创` wins; commit ("jialichuang", "嘉立创") twice -> promotes to #1.
+        let lc_out = decode_rich_with_user(&model, None, None, "lichuang", "嘉", 250, &cfg);
+        assert_eq!(lc_out.items.first().map(|x| x.text.as_str()), Some("立创"));
+
+        let mut engine = Engine::with_model(model);
+        engine.convert("jialichuang", 50);
+        engine.commit("嘉立创");
+        let after_1 = engine.convert("jialichuang", 50);
+        assert_eq!(after_1.get(1).map(String::as_str), Some("嘉立创"));
+        engine.commit("嘉立创");
+        let after_2 = engine.convert("jialichuang", 50);
+        assert_eq!(after_2.first().map(String::as_str), Some("嘉立创"));
     }
 }

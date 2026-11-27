@@ -451,6 +451,70 @@ mod tests {
             s.handle_key(KeyEvent::Escape, none);
         }
 
+        // 4b. English-only candidates in Chinese mode (e.g. `Unity` + `6` / `2` / `1`, or lowercase
+        // non-pinyin `unity` + `6`) commit `raw + digit` directly into the input box while staying
+        // in Chinese mode; subsequent digits pass straight through (`Unity2022`).
+        for (digit, expected) in [(6, "Unity6"), (2, "Unity2"), (1, "Unity1")] {
+            s.handle_key(KeyEvent::UpperChar('U'), shift);
+            for ch in ['n', 'i', 't', 'y'] {
+                s.handle_key(KeyEvent::Char(ch), none);
+            }
+            assert_eq!(s.current_page().2, &["Unity".to_owned()][..]);
+            assert_eq!(
+                s.handle_key(KeyEvent::Digit(digit), none),
+                KeyAction::Commit {
+                    text: expected.into(),
+                    learn_keys: None,
+                    learn_text: None,
+                }
+            );
+            assert!(!s.is_composing());
+            assert_eq!(s.mode(), InputMode::Chinese);
+            assert!(!s.should_consume(KeyEvent::Digit(0), none));
+        }
+
+        // Lowercase non-pinyin with empty/ASCII-only candidates also commits `unity6`.
+        for ch in ['u', 'n', 'i', 't', 'y'] {
+            s.handle_key(KeyEvent::Char(ch), none);
+        }
+        s.set_candidates(vec![]);
+        assert_eq!(
+            s.handle_key(KeyEvent::Digit(6), none),
+            KeyAction::Commit {
+                text: "unity6".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+        assert!(!s.is_composing());
+
+        // Multi-candidate English completions (`Hel` -> `["Hel", "Hello", "Help"]`):
+        // digits within candidate range pick completion, out-of-range digits commit `Hel6`.
+        s.handle_key(KeyEvent::UpperChar('H'), shift);
+        s.handle_key(KeyEvent::Char('e'), none);
+        s.handle_key(KeyEvent::Char('l'), none);
+        assert!(s.current_page().2.len() >= 2);
+        assert_eq!(
+            s.handle_key(KeyEvent::Digit(6), none),
+            KeyAction::Commit {
+                text: "Hel6".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+        assert!(!s.is_composing());
+
+        // Chinese candidates must NOT commit raw pinyin when pressing an out-of-range digit.
+        s.handle_key(KeyEvent::Char('w'), none);
+        s.handle_key(KeyEvent::Char('o'), none);
+        s.set_candidates(vec!["我".into(), "喔".into()]);
+        assert_eq!(
+            s.handle_key(KeyEvent::Digit(6), none),
+            KeyAction::ConsumedNoChange
+        );
+        assert!(s.is_composing());
+        s.handle_key(KeyEvent::Escape, none);
+
         // 5. Fallback helper commits open composition cleanly and returns None when idle.
         s.handle_key(KeyEvent::Char('w'), none);
         s.handle_key(KeyEvent::Char('o'), none);
@@ -628,5 +692,188 @@ mod tests {
         updated.font_size = 16;
         s.apply_config(&updated, Some(&norm));
         assert!(s.chinese_punct());
+    }
+
+    #[test]
+    fn session_segment_locking_brackets_tab_and_wire_compat() {
+        use crate::protocol::{WireCandidate, WireCandidateKind};
+
+        // 1. Backward-compatible JSON deserialization when new rich fields are omitted.
+        let legacy_json = r#"{"kind":"candidates","candidates":["家里床","嘉"],"latency_ms":1.1}"#;
+        let parsed: IpcResponse = serde_json::from_str(legacy_json).unwrap();
+        match parsed {
+            IpcResponse::Candidates {
+                candidates,
+                items,
+                segmented_preedit,
+                first_char_offset,
+                first_syllable_len,
+                ..
+            } => {
+                assert_eq!(candidates, vec!["家里床", "嘉"]);
+                assert!(items.is_empty());
+                assert_eq!(segmented_preedit, None);
+                assert_eq!(first_char_offset, None);
+                assert_eq!(first_syllable_len, 0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // 2. Segment locking flow: `jialichuang` -> pick `嘉` (3) -> `lichuang` -> pick `立创` (8) -> Commit `嘉立创`.
+        let mut s = SessionController::new();
+        let none = KeyModifiers::default();
+        let shift = KeyModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        for ch in "jialichuang".chars() {
+            assert_eq!(
+                s.handle_key(KeyEvent::Char(ch), none),
+                KeyAction::UpdateComposition { need_convert: true }
+            );
+        }
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "家里床".into(), consumed_len: 11, kind: WireCandidateKind::Full },
+                WireCandidate { text: "家里创".into(), consumed_len: 11, kind: WireCandidateKind::Full },
+                WireCandidate { text: "家里".into(), consumed_len: 5, kind: WireCandidateKind::PrefixWord },
+                WireCandidate { text: "家".into(), consumed_len: 3, kind: WireCandidateKind::PrefixChar },
+                WireCandidate { text: "嘉".into(), consumed_len: 3, kind: WireCandidateKind::PrefixChar },
+            ],
+            Some("jia'li'chuang".into()),
+            Some(3),
+            3,
+        );
+        assert_eq!(s.panel_preedit(), "jia'li'chuang");
+        assert!(!s.is_single_char_mode());
+
+        // Tab enters single-char quick view (index 0 is `家`, index 1 is `嘉`).
+        assert_eq!(
+            s.handle_key(KeyEvent::Tab, none),
+            KeyAction::UpdateComposition { need_convert: false }
+        );
+        assert!(s.is_single_char_mode());
+        assert_eq!(s.current_page().2, &["家".to_owned(), "嘉".to_owned()][..]);
+
+        // Tab again restores original view and selection.
+        assert_eq!(
+            s.handle_key(KeyEvent::Tab, none),
+            KeyAction::UpdateComposition { need_convert: false }
+        );
+        assert!(!s.is_single_char_mode());
+        assert_eq!(s.current_page().2.first().map(String::as_str), Some("家里床"));
+
+        // Enter single-char view and select `嘉` via Digit(2).
+        s.handle_key(KeyEvent::Tab, none);
+        assert_eq!(
+            s.handle_key(KeyEvent::Digit(2), none),
+            KeyAction::UpdateComposition { need_convert: true }
+        );
+        assert!(s.has_locked());
+        assert_eq!(s.locked_text(), "嘉");
+        assert_eq!(s.keys(), "lichuang");
+        assert_eq!(s.inline_preedit(), "嘉lichuang");
+        assert!(!s.is_single_char_mode());
+
+        // Backspace while locked pops `嘉` and restores `jialichuang`.
+        assert_eq!(
+            s.handle_key(KeyEvent::Backspace, none),
+            KeyAction::UpdateComposition { need_convert: true }
+        );
+        assert!(!s.has_locked());
+        assert_eq!(s.keys(), "jialichuang");
+
+        // Re-apply candidates and test `[` / `]` bracket pick.
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "嘉利创".into(), consumed_len: 11, kind: WireCandidateKind::Full },
+                WireCandidate { text: "家里".into(), consumed_len: 5, kind: WireCandidateKind::PrefixWord },
+                WireCandidate { text: "嘉".into(), consumed_len: 3, kind: WireCandidateKind::PrefixChar },
+            ],
+            Some("jia'li'chuang".into()),
+            Some(2),
+            3,
+        );
+        // `[` picks first char `嘉` (3 bytes) and keeps `lichuang`.
+        assert_eq!(
+            s.handle_key(KeyEvent::RawChar('['), none),
+            KeyAction::UpdateComposition { need_convert: true }
+        );
+        assert_eq!(s.locked_text(), "嘉");
+        assert_eq!(s.keys(), "lichuang");
+
+        // Now complete with `立创`.
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "立创".into(), consumed_len: 8, kind: WireCandidateKind::Full },
+                WireCandidate { text: "立".into(), consumed_len: 2, kind: WireCandidateKind::PrefixChar },
+            ],
+            Some("li'chuang".into()),
+            Some(1),
+            2,
+        );
+        assert_eq!(s.panel_preedit(), "嘉 li'chuang");
+        assert_eq!(
+            s.handle_key(KeyEvent::Space, none),
+            KeyAction::Commit {
+                text: "嘉立创".into(),
+                learn_keys: Some("jialichuang".into()),
+                learn_text: Some("嘉立创".into()),
+            }
+        );
+        assert!(!s.is_composing());
+
+        // 3. `]` picks last char of highlighted word; punctuation while prefix highlighted does not drop trailing keys.
+        for ch in "jialichuang".chars() {
+            s.handle_key(KeyEvent::Char(ch), none);
+        }
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "家里床".into(), consumed_len: 11, kind: WireCandidateKind::Full },
+                WireCandidate { text: "佳丽".into(), consumed_len: 5, kind: WireCandidateKind::PrefixWord },
+            ],
+            Some("jia'li'chuang".into()),
+            None,
+            3,
+        );
+        // Move highlight to prefix `佳丽` (index 1) and press `]` -> locks `丽` (5 bytes), leaves `chuang`.
+        s.handle_key(KeyEvent::Down, none);
+        assert_eq!(
+            s.handle_key(KeyEvent::RawChar(']'), none),
+            KeyAction::UpdateComposition { need_convert: true }
+        );
+        assert_eq!(s.locked_text(), "丽");
+        assert_eq!(s.keys(), "chuang");
+
+        // Pressing comma while a prefix candidate is highlighted promotes the full-span candidate (`创`).
+        s.set_rich_candidates(
+            vec![
+                WireCandidate { text: "创".into(), consumed_len: 6, kind: WireCandidateKind::Full },
+                WireCandidate { text: "ch".into(), consumed_len: 2, kind: WireCandidateKind::PrefixChar },
+            ],
+            Some("chuang".into()),
+            Some(1),
+            6,
+        );
+        s.handle_key(KeyEvent::Down, none);
+        assert_eq!(
+            s.handle_key(KeyEvent::Char(','), none),
+            KeyAction::Commit {
+                text: "丽创，".into(),
+                learn_keys: Some("jialichuang".into()),
+                learn_text: Some("丽创".into()),
+            }
+        );
+
+        // 4. English composing passes `[` through literally instead of triggering first-char pick.
+        s.handle_key(KeyEvent::UpperChar('A'), shift);
+        assert_eq!(
+            s.handle_key(KeyEvent::RawChar('['), none),
+            KeyAction::Commit {
+                text: "A[".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
     }
 }

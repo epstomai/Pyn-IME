@@ -3,6 +3,7 @@
 #![allow(non_snake_case)]
 
 mod candidate_ui;
+mod debug_log;
 mod display_attr;
 mod edit_session;
 mod globals;
@@ -22,6 +23,7 @@ use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DET
 use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
 use windows_core::{implement, BOOL, ComObject, GUID, HRESULT, Interface, PCWSTR, Ref, Result};
 
+use crate::debug_log::tsf_log;
 use crate::globals::{dll_add_ref, dll_ref_count, dll_release, set_dll_instance};
 use crate::guids::active_guids;
 use crate::text_service::TextService;
@@ -50,20 +52,36 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
         if ppvobject.is_null() {
+            tsf_log!(
+                "com",
+                "CreateInstance ppvobject=null hr=0x{:08x}",
+                E_INVALIDARG.0 as u32
+            );
             return Err(windows_core::Error::from(E_INVALIDARG));
         }
         unsafe {
             *ppvobject = null_mut();
         }
         if !punkouter.is_null() {
+            tsf_log!(
+                "com",
+                "CreateInstance aggregation_unsupported hr=0x{:08x}",
+                E_NOINTERFACE.0 as u32
+            );
             return Err(windows_core::Error::from(E_NOINTERFACE));
         }
         if riid.is_null() {
+            tsf_log!(
+                "com",
+                "CreateInstance riid=null hr=0x{:08x}",
+                E_INVALIDARG.0 as u32
+            );
             return Err(windows_core::Error::from(E_INVALIDARG));
         }
         let tip = ComObject::new(TextService::new()).into_interface::<ITfTextInputProcessorEx>();
         let unk: windows_core::IUnknown = tip.into();
         let hr = unsafe { unk.query(riid, ppvobject) };
+        tsf_log!("com", "CreateInstance hr=0x{:08x}", hr.0 as u32);
         if hr.is_ok() {
             Ok(())
         } else {
@@ -102,18 +120,39 @@ pub unsafe extern "system" fn DllGetClassObject(
     ppv: *mut *mut c_void,
 ) -> HRESULT {
     if ppv.is_null() {
+        tsf_log!(
+            "com",
+            "DllGetClassObject ppv=null hr=0x{:08x}",
+            E_INVALIDARG.0 as u32
+        );
         return E_INVALIDARG;
     }
     *ppv = null_mut();
     if rclsid.is_null() || riid.is_null() {
+        tsf_log!(
+            "com",
+            "DllGetClassObject null_ptr hr=0x{:08x}",
+            E_INVALIDARG.0 as u32
+        );
         return E_INVALIDARG;
     }
     if *rclsid != active_guids().clsid {
+        tsf_log!(
+            "com",
+            "DllGetClassObject rclsid_match=false hr=0x{:08x}",
+            CLASS_E_CLASSNOTAVAILABLE.0 as u32
+        );
         return CLASS_E_CLASSNOTAVAILABLE;
     }
     let factory = ComObject::new(ClassFactory::new()).into_interface::<IClassFactory>();
     let unk: windows_core::IUnknown = factory.into();
-    unk.query(riid, ppv)
+    let hr = unk.query(riid, ppv);
+    tsf_log!(
+        "com",
+        "DllGetClassObject rclsid_match=true hr=0x{:08x}",
+        hr.0 as u32
+    );
+    hr
 }
 
 #[no_mangle]
@@ -127,6 +166,7 @@ pub unsafe extern "system" fn DllCanUnloadNow() -> HRESULT {
 
 #[no_mangle]
 pub unsafe extern "system" fn DllInstall(b_install: BOOL, psz_cmd_line: PCWSTR) -> HRESULT {
+    debug_log::refresh_enabled();
     if b_install.as_bool() && !psz_cmd_line.is_null() {
         let mut len = 0usize;
         while *psz_cmd_line.0.add(len) != 0 {
@@ -135,12 +175,32 @@ pub unsafe extern "system" fn DllInstall(b_install: BOOL, psz_cmd_line: PCWSTR) 
         let slice = std::slice::from_raw_parts(psz_cmd_line.0, len);
         let cmd = String::from_utf16_lossy(slice);
         if cmd.trim().eq_ignore_ascii_case("activate") {
-            return match register::activate_profile_for_session() {
+            let hr = match register::activate_profile_for_session() {
                 Ok(()) => S_OK,
                 Err(e) => e.code(),
             };
+            tsf_log!(
+                "com",
+                "DllInstall b_install=true cmd={} hr=0x{:08x}",
+                cmd.trim(),
+                hr.0 as u32
+            );
+            return hr;
         }
+        tsf_log!(
+            "com",
+            "DllInstall b_install=true cmd={} hr=0x{:08x}",
+            cmd.trim(),
+            S_OK.0 as u32
+        );
+        return S_OK;
     }
+    tsf_log!(
+        "com",
+        "DllInstall b_install={} hr=0x{:08x}",
+        b_install.as_bool(),
+        S_OK.0 as u32
+    );
     S_OK
 }
 

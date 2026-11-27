@@ -214,9 +214,36 @@ impl ITfEditSession_Impl for UpdateCompositionSession_Impl {
             Some(pair) => pair,
             None => {
                 *self.composition_slot.borrow_mut() = None;
-                let c = start_new_composition(&self.context, ec, &self.comp_sink)?;
-                let range = unsafe { c.GetRange()? };
-                unsafe { range.SetText(ec, 0, &wtext)? };
+                let c = match start_new_composition(&self.context, ec, &self.comp_sink) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        crate::debug_log::tsf_log!(
+                            "edit_session",
+                            "UpdateComposition start_new_composition failed hr=0x{:08x}",
+                            e.code().0 as u32
+                        );
+                        return Err(e);
+                    }
+                };
+                let range = match unsafe { c.GetRange() } {
+                    Ok(r) => r,
+                    Err(e) => {
+                        crate::debug_log::tsf_log!(
+                            "edit_session",
+                            "UpdateComposition GetRange failed hr=0x{:08x}",
+                            e.code().0 as u32
+                        );
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = unsafe { range.SetText(ec, 0, &wtext) } {
+                    crate::debug_log::tsf_log!(
+                        "edit_session",
+                        "UpdateComposition SetText failed hr=0x{:08x}",
+                        e.code().0 as u32
+                    );
+                    return Err(e);
+                }
                 (c, range)
             }
         };
@@ -283,10 +310,21 @@ impl ITfEditSession_Impl for CommitCompositionSession_Impl {
         }
 
         if let Ok(insert) = self.context.cast::<ITfInsertAtSelection>() {
-            let range = unsafe {
-                insert.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &wtext)?
-            };
-            let _ = set_selection_to_end(&self.context, ec, &range);
+            match unsafe {
+                insert.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &wtext)
+            } {
+                Ok(range) => {
+                    let _ = set_selection_to_end(&self.context, ec, &range);
+                }
+                Err(e) => {
+                    crate::debug_log::tsf_log!(
+                        "edit_session",
+                        "CommitComposition InsertTextAtSelection failed hr=0x{:08x}",
+                        e.code().0 as u32
+                    );
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }

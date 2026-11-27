@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ctypes.wintypes as wt
+import hashlib
 import os
 import re
 import shutil
@@ -29,6 +31,10 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
 LOTP_DISABLED = 0x00000002
+TH32CS_SNAPPROCESS = 0x00000002
+TH32CS_SNAPMODULE = 0x00000008
+TH32CS_SNAPMODULE32 = 0x00000010
+ZH_CN_SORTORDER_ITEM0_KEY = rf"Software\Microsoft\CTF\SortOrder\AssemblyItem\{LANGID_STR}\{{34745C63-B2F0-4784-8B67-5E12C8701A31}}\00000000"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "PynServer"
 _GEN_DLL_RE = re.compile(r"^ime_tsf(?:_x86)?_g([0-9a-f]{4})\.dll$", re.IGNORECASE)
@@ -54,6 +60,36 @@ class _LAYOUTORTIPPROFILE(ctypes.Structure):
         ("dwSubstituteLayout", ctypes.c_uint32),
         ("dwFlags", ctypes.c_uint32),
         ("szId", ctypes.c_wchar * 260),
+    ]
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("cntUsage", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wt.DWORD),
+        ("cntThreads", wt.DWORD),
+        ("th32ParentProcessID", wt.DWORD),
+        ("pcPriClassBase", wt.LONG),
+        ("dwFlags", wt.DWORD),
+        ("szExeFile", wt.WCHAR * 260),
+    ]
+
+
+class _MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("th32ModuleID", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("GlblcntUsage", wt.DWORD),
+        ("ProccntUsage", wt.DWORD),
+        ("modBaseAddr", ctypes.c_void_p),
+        ("modBaseSize", wt.DWORD),
+        ("hModule", wt.HMODULE),
+        ("szModule", wt.WCHAR * 256),
+        ("szExePath", wt.WCHAR * 260),
     ]
 
 
@@ -248,8 +284,8 @@ def _get_primary_language() -> str | None:
         return None
 
 
-def _enum_enabled_zh_cn_tips() -> set[tuple[str, str]]:
-    enabled: set[tuple[str, str]] = set()
+def _enum_layout_or_tips() -> list[tuple[int, int, int, int, str]]:
+    items: list[tuple[int, int, int, int, str]] = []
     try:
         input_dll = ctypes.WinDLL("input.dll")
         enum_fn = input_dll.EnumEnabledLayoutOrTip
@@ -263,18 +299,27 @@ def _enum_enabled_zh_cn_tips() -> set[tuple[str, str]]:
         enum_fn.restype = ctypes.c_uint32
         cnt = enum_fn(None, None, None, None, 0)
         if cnt == 0:
-            return enabled
+            return items
         buf = (_LAYOUTORTIPPROFILE * cnt)()
         got = enum_fn(None, None, None, buf, cnt)
         for i in range(got):
             p = buf[i]
-            if p.langid != 0x0804 or (p.dwFlags & LOTP_DISABLED) != 0:
-                continue
-            m = _TIP_ID_RE.match(p.szId.strip())
-            if m:
-                enabled.add((m.group(1).upper(), m.group(2).upper()))
+            items.append(
+                (p.dwProfileType, p.langid, p.dwSubstituteLayout, p.dwFlags, p.szId.strip())
+            )
     except Exception:
         pass
+    return items
+
+
+def _enum_enabled_zh_cn_tips() -> set[tuple[str, str]]:
+    enabled: set[tuple[str, str]] = set()
+    for _, langid, _, flags, sz_id in _enum_layout_or_tips():
+        if langid != 0x0804 or (flags & LOTP_DISABLED) != 0:
+            continue
+        m = _TIP_ID_RE.match(sz_id)
+        if m:
+            enabled.add((m.group(1).upper(), m.group(2).upper()))
     return enabled
 
 
@@ -442,7 +487,11 @@ def _cleanup_obsolete_dlls(target_dir: Path, keep_names: set[str]) -> list[Path]
         low = p.name.lower()
         if low in keep_lower:
             continue
-        if not low.startswith("ime_tsf") or (".dll" not in low):
+        is_obsolete_tsf = low.startswith("ime_tsf") and (".dll" in low)
+        is_exe_old = low.startswith("ime-server.exe.old.") or low.startswith(
+            "ime-settings.exe.old."
+        )
+        if not (is_obsolete_tsf or is_exe_old):
             continue
         if not _try_remove_file(p):
             _schedule_delete_on_reboot(p)
@@ -450,13 +499,58 @@ def _cleanup_obsolete_dlls(target_dir: Path, keep_names: set[str]) -> list[Path]
     return locked
 
 
-def _activate_session(dll_x64: Path) -> bool:
+def _file_sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _norm_win_path(p: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _is_stable_tip_registered(target_dir: Path) -> bool:
+    if discover_registered_generations() != [0]:
+        return False
+    x64_reg = check_hklm_clsid(winreg.KEY_WOW64_64KEY, LEGACY_CLSID)
+    x86_reg = check_hklm_clsid(winreg.KEY_WOW64_32KEY, LEGACY_CLSID)
+    if not x64_reg or not x86_reg:
+        return False
+    if _norm_win_path(x64_reg) != _norm_win_path(target_dir / "ime_tsf.dll"):
+        return False
+    if _norm_win_path(x86_reg) != _norm_win_path(target_dir / "ime_tsf_x86.dll"):
+        return False
+    if check_hklm_language_profile(LEGACY_CLSID, LEGACY_PROFILE) is None:
+        return False
+    if (LEGACY_CLSID.upper(), LEGACY_PROFILE.upper()) not in _enum_enabled_zh_cn_tips():
+        return False
+    if _get_current_default_zh_cn_tip() != (LEGACY_CLSID.upper(), LEGACY_PROFILE.upper()):
+        return False
+    return True
+
+
+def _grant_appcontainer_acl(target_dir: Path) -> None:
+    # Grant ALL APPLICATION PACKAGES (*S-1-15-2-1) RX access so AppContainer apps can load TSF DLLs.
+    subprocess.run(
+        ["icacls", str(target_dir), "/grant", "*S-1-15-2-1:(OI)(CI)(RX)", "/T", "/Q"],
+        check=True,
+    )
+
+
+def _activate_session(dll_x64: Path) -> tuple[bool, int]:
     res = subprocess.run(
         [str(_regsvr32_path(x86=False)), "/n", "/i:activate", "/s", str(dll_x64)],
         check=False,
         capture_output=True,
     )
-    return res.returncode == 0
+    return (res.returncode == 0, res.returncode)
 
 
 def _copy_replace_locked(src: Path, dst: Path) -> bool:
@@ -470,7 +564,10 @@ def _copy_replace_locked(src: Path, dst: Path) -> bool:
         if not dst.exists():
             raise
         backup = dst.with_name(f"{dst.name}.old.{os.getpid()}.{int(time.time())}")
+        if backup.exists():
+            backup = dst.with_name(f"{dst.name}.old.{os.getpid()}.{time.time_ns()}")
         dst.replace(backup)
+        _schedule_delete_on_reboot(backup)
         shutil.copy2(src, dst)
         return True
 
@@ -520,6 +617,33 @@ def _migrate_legacy_user_data() -> None:
         print(f"migrated user data from {legacy_dir} -> {new_dir}: {', '.join(migrated)}")
 
 
+def _register_tip_and_migrate(
+    target_gen: int,
+    dll_x64: Path,
+    dll_x86: Path | None,
+    remove_gens: list[int],
+) -> tuple[bool, int]:
+    tip_id = tip_id_for_generation(target_gen)
+    if dll_x86 is not None and dll_x86.exists():
+        subprocess.run([str(_regsvr32_path(x86=True)), "/s", str(dll_x86)], check=True)
+    subprocess.run([str(_regsvr32_path(x86=False)), "/s", str(dll_x64)], check=True)
+    ok = install_layout_or_tip(tip_id, 0)
+    assert ok, f"InstallLayoutOrTip({tip_id}, 0) failed"
+
+    # Enable, set default zh-CN TIP, and activate BEFORE uninstalling old generations
+    # so running apps never observe a gap with zero valid Pyn TIPs.
+    _ensure_zh_cn_default_tip(target_gen, remove_gens)
+    _activate_session(dll_x64)
+
+    for og in remove_gens:
+        _unregister_generation(og)
+    _cleanup_stale_hkcu_tips(target_gen)
+
+    # Re-confirm after removing old generations in case ILOT_UNINSTALL cleared defaults.
+    _ensure_zh_cn_default_tip(target_gen, remove_gens)
+    return _activate_session(dll_x64)
+
+
 def cmd_deploy(args) -> None:
     if not is_admin() and str(args.dir).lower().startswith(
         os.environ.get("ProgramFiles", r"C:\Program Files").lower()
@@ -553,14 +677,6 @@ def cmd_deploy(args) -> None:
     if target_dir.resolve() != LEGACY_DIR.resolve():
         _shutdown_server_and_wait(LEGACY_DIR / "ime-server.exe")
 
-    old_gens = discover_registered_generations()
-    new_gen = choose_next_generation(target_dir, old_gens)
-    x64_name, x86_name = dll_names_for_generation(new_gen)
-    dst_x64 = target_dir / x64_name
-    dst_x86 = target_dir / x86_name
-
-    shutil.copy2(dll_src, dst_x64)
-    shutil.copy2(dll_x86_src, dst_x86)
     _copy_replace_locked(srv_src, dst_srv)
     if gui_src.exists():
         _copy_replace_locked(gui_src, target_dir / "ime-settings.exe")
@@ -568,35 +684,106 @@ def cmd_deploy(args) -> None:
     _copy_if_changed(mod_src, models_dir / "ime_model.bin")
     if rer_src.exists():
         _copy_if_changed(rer_src, models_dir / "reranker.bin")
-    _write_generation_file(target_dir, new_gen)
-
-    # Grant ALL APPLICATION PACKAGES (*S-1-15-2-1) RX access so AppContainer apps can load ime_tsf_gNNNN.dll.
-    subprocess.run(
-        ["icacls", str(target_dir), "/grant", "*S-1-15-2-1:(OI)(CI)(RX)", "/T", "/Q"],
-        check=True,
-    )
-
     _set_startup_run_entry(dst_srv)
 
+    old_gens = discover_registered_generations()
+
+    if not args.hotswap_clsid:
+        x64_name, x86_name = dll_names_for_generation(0)
+        dst_x64 = target_dir / x64_name
+        dst_x86 = target_dir / x86_name
+        tsf_unchanged = (
+            _file_sha256(dll_src) == _file_sha256(dst_x64)
+            and _file_sha256(dll_x86_src) == _file_sha256(dst_x86)
+        )
+        stable_ok = _is_stable_tip_registered(target_dir)
+
+        if stable_ok and tsf_unchanged:
+            _write_generation_file(target_dir, 0)
+            locked = _cleanup_obsolete_dlls(target_dir, {x64_name, x86_name})
+            print("TSF DLLs unchanged (stable CLSID); skipped COM/TSF re-registration.")
+            if locked:
+                print(
+                    f"note: {len(locked)} unreferenced old file(s) still mapped by existing processes "
+                    "scheduled for automatic deletion on next reboot."
+                )
+            return
+
+        if stable_ok and not tsf_unchanged:
+            replaced_locked_64 = _copy_replace_locked(dll_src, dst_x64)
+            replaced_locked_86 = _copy_replace_locked(dll_x86_src, dst_x86)
+            _write_generation_file(target_dir, 0)
+            _grant_appcontainer_acl(target_dir)
+            locked = _cleanup_obsolete_dlls(target_dir, {x64_name, x86_name})
+            print(
+                f"updated stable TSF DLLs in-place ({x64_name}, {x86_name}) without changing CLSID; "
+                "running apps remain uninterrupted and new apps load the update."
+            )
+            if replaced_locked_64 or replaced_locked_86 or locked:
+                print(
+                    f"note: {len(locked)} old file(s) still mapped by running processes "
+                    "scheduled for automatic deletion on next reboot."
+                )
+            return
+
+        # Path 3: Fresh install or one-time migration from legacy generationed CLSIDs (g0001..gFFFF).
+        _copy_replace_locked(dll_src, dst_x64)
+        _copy_replace_locked(dll_x86_src, dst_x86)
+        _write_generation_file(target_dir, 0)
+        _grant_appcontainer_acl(target_dir)
+
+        legacy_gens = [g for g in old_gens if g != 0]
+        if old_gens or not args.no_hotswap:
+            activated, activate_rc = _register_tip_and_migrate(
+                0, dst_x64, dst_x86, legacy_gens
+            )
+            locked = _cleanup_obsolete_dlls(target_dir, {x64_name, x86_name})
+            if legacy_gens:
+                old_str = ", ".join(f"g{g:04x}" for g in legacy_gens)
+                print(
+                    f"migrated legacy TSF {old_str} -> stable CLSID ({TIP_ID}) in {target_dir} "
+                    f"({x64_name}, {x86_name}); future deploys will never churn CLSIDs again."
+                )
+            else:
+                print(
+                    f"deployed & registered stable TSF ({TIP_ID}) in {target_dir} "
+                    f"({x64_name}, {x86_name}, with ALL APPLICATION PACKAGES RX ACL)"
+                )
+            if not activated:
+                print(
+                    f"note: session-wide ActivateProfile returned rc={activate_rc} "
+                    f"(0x{activate_rc & 0xFFFFFFFF:08x}, e.g. current keyboard is EN-US or isolated desktop); "
+                    "InstallLayoutOrTip has already updated active zh-CN TIP."
+                )
+            if locked:
+                print(
+                    f"note: {len(locked)} unreferenced old file(s) still mapped by existing processes "
+                    "scheduled for automatic deletion on next reboot."
+                )
+        else:
+            locked = _cleanup_obsolete_dlls(target_dir, {x64_name, x86_name})
+            print(
+                f"deployed stable TSF files ({x64_name}, {x86_name}) to {target_dir} "
+                "(with ALL APPLICATION PACKAGES RX ACL)"
+            )
+            print("note: run `install_tsf.py register` to register COM + TSF profile.")
+        return
+
+    # Opt-in legacy CLSID-generation hot-swap mode (--hotswap-clsid).
+    new_gen = choose_next_generation(target_dir, old_gens)
+    x64_name, x86_name = dll_names_for_generation(new_gen)
+    dst_x64 = target_dir / x64_name
+    dst_x86 = target_dir / x86_name
+
+    shutil.copy2(dll_src, dst_x64)
+    shutil.copy2(dll_x86_src, dst_x86)
+    _write_generation_file(target_dir, new_gen)
+    _grant_appcontainer_acl(target_dir)
+
     if old_gens and not args.no_hotswap:
-        new_tip_id = tip_id_for_generation(new_gen)
-
-        subprocess.run([str(_regsvr32_path(x86=True)), "/s", str(dst_x86)], check=True)
-        subprocess.run([str(_regsvr32_path(x86=False)), "/s", str(dst_x64)], check=True)
-        ok = install_layout_or_tip(new_tip_id, 0)
-        assert ok, f"InstallLayoutOrTip({new_tip_id}, 0) failed"
-
-        for og in old_gens:
-            install_layout_or_tip(tip_id_for_generation(og), 1)
-
-        _ensure_zh_cn_default_tip(new_gen, old_gens)
-
-        activated = _activate_session(dst_x64)
-
-        for og in old_gens:
-            _unregister_generation(og)
-        _cleanup_stale_hkcu_tips(new_gen)
-
+        activated, activate_rc = _register_tip_and_migrate(
+            new_gen, dst_x64, dst_x86, old_gens
+        )
         locked = _cleanup_obsolete_dlls(target_dir, {x64_name, x86_name})
         old_str = ", ".join(f"g{g:04x}" for g in old_gens)
         print(
@@ -605,12 +792,13 @@ def cmd_deploy(args) -> None:
         )
         if not activated:
             print(
-                "note: session-wide ActivateProfile returned non-zero (e.g. current keyboard is EN-US); "
-                "InstallLayoutOrTip has already switched active TIP so background apps load the new generation on focus/typing."
+                f"note: session-wide ActivateProfile returned rc={activate_rc} "
+                f"(0x{activate_rc & 0xFFFFFFFF:08x}, e.g. current keyboard is EN-US or isolated desktop); "
+                "InstallLayoutOrTip has already updated active zh-CN TIP."
             )
         if locked:
             print(
-                f"note: {len(locked)} unreferenced old DLL file(s) still mapped by existing processes "
+                f"note: {len(locked)} unreferenced old file(s) still mapped by existing processes "
                 "scheduled for automatic deletion on next reboot."
             )
     else:
@@ -649,23 +837,14 @@ def cmd_register(args) -> None:
     tip_id = tip_id_for_generation(target_gen)
     old_gens = [g for g in discover_registered_generations() if g != target_gen]
 
-    if dll_x86.exists():
-        subprocess.run([str(_regsvr32_path(x86=True)), "/s", str(dll_x86)], check=True)
-    subprocess.run([str(_regsvr32_path(x86=False)), "/s", str(dll)], check=True)
-    ok = install_layout_or_tip(tip_id, 0)
-    assert ok, f"InstallLayoutOrTip({tip_id}, 0) failed"
+    activated, activate_rc = _register_tip_and_migrate(target_gen, dll, dll_x86, old_gens)
 
-    for og in old_gens:
-        _unregister_generation(og)
-    _ensure_zh_cn_default_tip(target_gen, old_gens)
-    _cleanup_stale_hkcu_tips(target_gen)
-
-    activated = _activate_session(dll)
     x86_msg = f" + 32-bit ({dll_x86})" if dll_x86.exists() else ""
     print(f"registered COM + TSF TIP ({tip_id}): {dll}{x86_msg}")
     if not activated:
         print(
-            "note: session-wide ActivateProfile returned non-zero; "
+            f"note: session-wide ActivateProfile returned rc={activate_rc} "
+            f"(0x{activate_rc & 0xFFFFFFFF:08x}); "
             "InstallLayoutOrTip has registered the profile for active apps."
         )
 
@@ -726,6 +905,18 @@ def cmd_start(args) -> None:
             close_fds=True,
         )
     print(f"started detached background daemon: {srv}")
+    deadline = time.monotonic() + 3.0
+    pong_out = None
+    while time.monotonic() < deadline:
+        res = subprocess.run([str(srv), "--ping"], capture_output=True, text=True)
+        if res.returncode == 0:
+            pong_out = res.stdout.strip()
+            break
+        time.sleep(0.15)
+    if pong_out:
+        print(f"ime-server ping: {pong_out}")
+    else:
+        print("note: ime-server is still initializing or unreachable via --ping.")
 
 
 def _create_settings_shortcut(target_exe: Path) -> None:
@@ -780,13 +971,17 @@ def cmd_stop(args) -> None:
         print(f"server not running or unreachable ({res.stderr.strip()})")
 
 
+def _format_gen_label(gen: int) -> str:
+    return "g0000 / stable (ime_tsf.dll)" if gen == 0 else f"g{gen:04x}"
+
+
 def cmd_status(args) -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     target_dir = Path(args.dir)
     gen_file_val = _read_generation_file(target_dir)
     print(
         f"Deployed generation ({GEN_FILE}): "
-        + (f"g{gen_file_val:04x}" if gen_file_val is not None else "none")
+        + (_format_gen_label(gen_file_val) if gen_file_val is not None else "none")
     )
 
     gens = discover_registered_generations()
@@ -798,9 +993,10 @@ def cmd_status(args) -> None:
             x64_path = check_hklm_clsid(winreg.KEY_WOW64_64KEY, clsid)
             x86_path = check_hklm_clsid(winreg.KEY_WOW64_32KEY, clsid)
             lp_desc = check_hklm_language_profile(clsid, prof)
-            print(f"[g{g:04x}] HKLM CLSID x64 {clsid}: {x64_path or 'not registered'}")
-            print(f"[g{g:04x}] HKLM CLSID x86 {clsid}: {x86_path or 'not registered'}")
-            print(f"[g{g:04x}] HKLM LanguageProfile {LANGID_STR} {prof}: {lp_desc or 'not registered'}")
+            tag = _format_gen_label(g)
+            print(f"[{tag}] HKLM CLSID x64 {clsid}: {x64_path or 'not registered'}")
+            print(f"[{tag}] HKLM CLSID x86 {clsid}: {x86_path or 'not registered'}")
+            print(f"[{tag}] HKLM LanguageProfile {LANGID_STR} {prof}: {lp_desc or 'not registered'}")
 
     srv = target_dir / "ime-server.exe"
     if not srv.exists():
@@ -815,12 +1011,203 @@ def cmd_status(args) -> None:
         print("ime-server.exe: not built")
 
 
+def _pyn_local_data_dir() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if not local_app_data:
+        raise SystemExit("LOCALAPPDATA environment variable is not set")
+    return Path(local_app_data) / "Pyn"
+
+
+def _tail_lines(path: Path, n: int) -> list[str]:
+    if not path.is_file():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return lines[-n:] if n > 0 else []
+
+
+def _read_hkcu_values(subkey: str) -> dict[str, object] | None:
+    try:
+        vals: dict[str, object] = {}
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey) as k:
+            i = 0
+            while True:
+                try:
+                    n, v, _ = winreg.EnumValue(k, i)
+                    vals[n] = v
+                    i += 1
+                except OSError:
+                    break
+        return vals
+    except OSError:
+        return None
+
+
+def _snapshot_tsf_processes() -> list[tuple[int, str, bool, list[str]]]:
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+    k32.CloseHandle.restype = wt.BOOL
+
+    invalid_handle = wt.HANDLE(-1).value
+    psnap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if psnap == invalid_handle:
+        return []
+
+    procs: list[tuple[int, str]] = []
+    try:
+        pe = _PROCESSENTRY32W(dwSize=ctypes.sizeof(_PROCESSENTRY32W))
+        ok = bool(k32.Process32FirstW(psnap, ctypes.byref(pe)))
+        while ok:
+            procs.append((int(pe.th32ProcessID), str(pe.szExeFile)))
+            ok = bool(k32.Process32NextW(psnap, ctypes.byref(pe)))
+    finally:
+        k32.CloseHandle(psnap)
+
+    rows: list[tuple[int, str, bool, list[str]]] = []
+    for pid, name in procs:
+        if pid == 0:
+            continue
+        msnap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+        if msnap == invalid_handle:
+            continue
+        has_msctf = False
+        tsf_mods: list[str] = []
+        try:
+            me = _MODULEENTRY32W(dwSize=ctypes.sizeof(_MODULEENTRY32W))
+            mok = bool(k32.Module32FirstW(msnap, ctypes.byref(me)))
+            while mok:
+                mod_name = str(me.szModule)
+                low = mod_name.lower()
+                if low.startswith("ime_tsf"):
+                    tsf_mods.append(mod_name)
+                elif low == "msctf.dll":
+                    has_msctf = True
+                mok = bool(k32.Module32NextW(msnap, ctypes.byref(me)))
+        finally:
+            k32.CloseHandle(msnap)
+
+        if tsf_mods or (name.lower() == "chrome.exe" and has_msctf):
+            rows.append((pid, name, has_msctf, tsf_mods))
+    return rows
+
+
+def cmd_debug(args) -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
+    pyn_dir = _pyn_local_data_dir()
+    flag = pyn_dir / "debug_tsf"
+    log_path = pyn_dir / "tsf_debug.log"
+
+    if args.on and args.off:
+        raise SystemExit("cannot pass both --on and --off")
+    if args.on:
+        pyn_dir.mkdir(parents=True, exist_ok=True)
+        flag.write_text("1\n", encoding="utf-8")
+        print(f"TSF debug logging ON ({flag})")
+    elif args.off:
+        _try_remove_file(flag)
+        print(f"TSF debug logging OFF ({flag})")
+
+    if args.clear:
+        removed = _try_remove_file(log_path)
+        print(f"Cleared TSF debug log ({log_path}): {removed}")
+
+    show_status = not (args.on or args.off or args.clear) or args.tail is not None
+    if show_status:
+        state = "ON" if flag.is_file() else "OFF"
+        size_info = f"{log_path.stat().st_size} bytes" if log_path.is_file() else "missing"
+        print(f"Flag: {state} ({flag})")
+        print(f"Log:  {log_path} ({size_info})")
+        n = args.tail if args.tail is not None else 20
+        lines = _tail_lines(log_path, n)
+        if lines:
+            print(f"--- Last {len(lines)} lines ---")
+            for line in lines:
+                print(line)
+
+
+def cmd_diag(args) -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
+    target_dir = Path(args.dir)
+    cur_gen = _read_generation_file(target_dir)
+    cur_x64, cur_x86 = dll_names_for_generation(cur_gen) if cur_gen is not None else ("", "")
+    cur_lower = {cur_x64.lower(), cur_x86.lower()} - {""}
+
+    print(
+        f"Deployed generation ({target_dir / GEN_FILE}): "
+        + (
+            f"{_format_gen_label(cur_gen)} ({cur_x64}, {cur_x86})"
+            if cur_gen is not None
+            else "none"
+        )
+    )
+
+    print("\n=== Processes with ime_tsf* or chrome.exe+msctf ===")
+    for pid, name, has_msctf, tsf_mods in _snapshot_tsf_processes():
+        mods_lower = {m.lower() for m in tsf_mods}
+        if cur_gen == 0:
+            if mods_lower & cur_lower:
+                tag = "[CURRENT stable]"
+            elif any(
+                m.startswith(("ime_tsf.dll.old.", "ime_tsf_x86.dll.old."))
+                for m in mods_lower
+            ):
+                tag = "[STABLE_PREV_DLL]"
+            elif tsf_mods:
+                tag = "[STALE OLD_CLSID]"
+            else:
+                tag = "[CHROME+MSCTF NO_CURRENT_PYN]"
+        else:
+            if cur_lower and (mods_lower & cur_lower):
+                tag = f"[CURRENT g{cur_gen:04x}]"
+            elif tsf_mods:
+                tag = "[STALE OLD_CLSID]"
+            else:
+                tag = "[CHROME+MSCTF NO_CURRENT_PYN]"
+        print(f"  PID={pid:6d} {name:26s} {tag:28s} msctf={has_msctf} tsf={tsf_mods}")
+
+    print("\n=== EnumEnabledLayoutOrTip ===")
+    for ptype, langid, subst, flags, sz_id in _enum_layout_or_tips():
+        print(f"  type={ptype} lang=0x{langid:04x} subst=0x{subst:08x} flags=0x{flags:x} id={sz_id}")
+
+    print(f"\n=== HKCU\\{ZH_CN_ASSEMBLY_KEY} ===")
+    asm = _read_hkcu_values(ZH_CN_ASSEMBLY_KEY)
+    if asm is None:
+        print("  (missing)")
+    else:
+        for key in ("Default", "Profile", "KeyboardLayout"):
+            if key in asm:
+                print(f"  {key} = {asm[key]!r}")
+
+    print(f"\n=== HKCU\\{ZH_CN_SORTORDER_ITEM0_KEY} ===")
+    sort0 = _read_hkcu_values(ZH_CN_SORTORDER_ITEM0_KEY)
+    if sort0 is None:
+        print("  (missing)")
+    else:
+        for key in ("CLSID", "Profile", "KeyboardLayout"):
+            if key in sort0:
+                print(f"  {key} = {sort0[key]!r}")
+
+    pyn_dir = _pyn_local_data_dir()
+    flag = pyn_dir / "debug_tsf"
+    log_path = pyn_dir / "tsf_debug.log"
+    print(f"\n=== TSF Debug Log (flag={'ON' if flag.is_file() else 'OFF'}) ===")
+    if log_path.is_file():
+        lines = _tail_lines(log_path, 40)
+        print(f"  {log_path} ({log_path.stat().st_size} bytes), showing last {len(lines)} lines:")
+        for line in lines:
+            print("  " + line)
+    else:
+        print(f"  {log_path} (not found)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_dep = sub.add_parser("deploy")
     p_dep.add_argument("--dir", default=str(DEFAULT_DIR))
+    p_dep.add_argument("--hotswap-clsid", action="store_true")
     p_dep.add_argument("--no-hotswap", action="store_true")
 
     p_reg = sub.add_parser("register")
@@ -840,6 +1227,15 @@ def main() -> None:
     p_stat = sub.add_parser("status")
     p_stat.add_argument("--dir", default=str(DEFAULT_DIR))
 
+    p_dbg = sub.add_parser("debug")
+    p_dbg.add_argument("--on", action="store_true")
+    p_dbg.add_argument("--off", action="store_true")
+    p_dbg.add_argument("--clear", action="store_true")
+    p_dbg.add_argument("--tail", nargs="?", const=40, type=int, default=None)
+
+    p_diag = sub.add_parser("diag")
+    p_diag.add_argument("--dir", default=str(DEFAULT_DIR))
+
     p_set = sub.add_parser("settings")
     p_set.add_argument("--dir", default=str(DEFAULT_DIR))
 
@@ -851,6 +1247,8 @@ def main() -> None:
         "start": cmd_start,
         "stop": cmd_stop,
         "status": cmd_status,
+        "debug": cmd_debug,
+        "diag": cmd_diag,
         "settings": cmd_settings,
     }[args.cmd](args)
 

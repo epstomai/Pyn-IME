@@ -1,5 +1,7 @@
 //! Single local inference and guarded-learning service over Win32 Named Pipes.
 
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -7,17 +9,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ime_core::decoder::decode_with_user;
+use ime_core::decoder::{decode_rich_with_user, decode_with_user, CandidateKind};
 use ime_core::user_dict::LearnDelta;
 use ime_core::{DecoderConfig, LearnConfig, Model, Reranker, UserMemory};
 use ime_ipc::config::ImeConfig;
 use ime_ipc::pipe::{to_wide_null, NamedPipeClient, NamedPipeServerInstance};
 use ime_ipc::protocol::{
-    read_frame, write_frame, IpcRequest, IpcResponse, DEFAULT_PIPE_NAME, LEGACY_PIPE_NAME,
+    read_frame, write_frame, IpcRequest, IpcResponse, WireCandidate, WireCandidateKind,
+    DEFAULT_PIPE_NAME, LEGACY_PIPE_NAME,
 };
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
+use windows::Win32::System::Console::{
+    AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows_core::PCWSTR;
@@ -281,7 +288,7 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
             };
             let mut dcfg = ctx.decoder_cfg;
             dcfg.cs_ai_boost = st.config.cs_ai_boost;
-            let outcome = decode_with_user(
+            let outcome = decode_rich_with_user(
                 &ctx.model,
                 ctx.reranker.as_deref(),
                 Some(&st.user),
@@ -290,15 +297,33 @@ fn handle_request(ctx: &ServerCtx, req: IpcRequest) -> IpcResponse {
                 limit,
                 &dcfg,
             );
+            let candidates: Vec<String> = outcome.items.iter().map(|it| it.text.clone()).collect();
+            let items: Vec<WireCandidate> = outcome
+                .items
+                .into_iter()
+                .map(|it| WireCandidate {
+                    text: it.text,
+                    consumed_len: it.consumed_len,
+                    kind: match it.kind {
+                        CandidateKind::Full => WireCandidateKind::Full,
+                        CandidateKind::PrefixWord => WireCandidateKind::PrefixWord,
+                        CandidateKind::PrefixChar => WireCandidateKind::PrefixChar,
+                    },
+                })
+                .collect();
             let sess = st.touch_session(session_id);
             sess.last_keys = keys;
             sess.last_base_top1 = outcome.base_top1;
-            sess.last_current_top1 = outcome.candidates.first().cloned();
+            sess.last_current_top1 = candidates.first().cloned();
             let latency_ms = started.elapsed().as_secs_f32() * 1000.0;
             IpcResponse::Candidates {
-                candidates: outcome.candidates,
+                candidates,
                 latency_ms,
                 config_revision: st.config_revision,
+                items,
+                segmented_preedit: Some(outcome.segmented_preedit),
+                first_char_offset: outcome.first_char_offset,
+                first_syllable_len: outcome.first_syllable_len,
             }
         }
         IpcRequest::Commit {
@@ -525,7 +550,18 @@ fn serve_pipe_loop(ctx: Arc<ServerCtx>, pipe_name: String) {
     }
 }
 
+fn has_valid_std_handle(kind: STD_HANDLE) -> bool {
+    matches!(unsafe { GetStdHandle(kind) }, Ok(h) if !h.0.is_null() && !h.is_invalid())
+}
+
+fn attach_parent_console_if_needed() {
+    if !has_valid_std_handle(STD_OUTPUT_HANDLE) && !has_valid_std_handle(STD_ERROR_HANDLE) {
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
 fn run_control_command(pipe_name: &str, req: IpcRequest) -> ! {
+    attach_parent_console_if_needed();
     match NamedPipeClient::connect(pipe_name, 1000).and_then(|mut c| c.request(&req)) {
         Ok(resp) => {
             println!("{}", serde_json::to_string(&resp).unwrap_or_default());
@@ -542,6 +578,7 @@ fn main() {
     let cli = match parse_args() {
         Ok(c) => c,
         Err(msg) => {
+            attach_parent_console_if_needed();
             eprintln!("error: {msg}");
             std::process::exit(2);
         }

@@ -226,7 +226,7 @@ mod tests {
     use crate::candidate_ui::{CandidateViewState, CandidateWindow};
     use windows::Win32::UI::TextServices::{
         ITfCompartmentEventSink, ITfCompositionSink, ITfDisplayAttributeProvider, ITfKeyEventSink,
-        ITfTextInputProcessor, ITfTextInputProcessorEx, ITfThreadMgrEventSink,
+        ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextLayoutSink, ITfThreadMgrEventSink,
     };
 
     #[test]
@@ -249,6 +249,7 @@ mod tests {
         assert!(tip.cast::<ITfCompositionSink>().is_ok());
         assert!(tip.cast::<ITfDisplayAttributeProvider>().is_ok());
         assert!(tip.cast::<ITfCompartmentEventSink>().is_ok());
+        assert!(tip.cast::<ITfTextLayoutSink>().is_ok());
 
         let dap = tip.cast::<ITfDisplayAttributeProvider>().unwrap();
         let attr = unsafe {

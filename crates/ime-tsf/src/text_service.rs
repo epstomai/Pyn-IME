@@ -29,8 +29,10 @@ use windows::Win32::UI::TextServices::{
     ITfCompositionSink_Impl, ITfContext, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
     ITfDisplayAttributeProvider_Impl, ITfDocumentMgr, ITfEditSession, ITfKeyEventSink,
     ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItem, ITfLangBarItemButton,
-    ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
-    ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
+    ITfContextView, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessorEx,
+    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfTextLayoutSink,
+    ITfTextLayoutSink_Impl, ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
+    TfLayoutCode, TF_LC_DESTROY,
     TF_CONVERSIONMODE_NATIVE, TF_CONVERSIONMODE_SYMBOL, TF_ES_ASYNCDONTCARE, TF_ES_READ,
     TF_ES_READWRITE, TF_ES_SYNC, TF_INVALID_COOKIE, TF_MOD_CONTROL, TF_MOD_ON_KEYUP,
     TF_PRESERVEDKEY,
@@ -42,7 +44,7 @@ use crate::debug_log::{is_enabled, tsf_log};
 use crate::display_attr::{EnumDisplayAttributeInfo, InputDisplayAttributeInfo};
 use crate::edit_session::{
     CancelCompositionSession, CommitCompositionSession, ReadContextAndCaretSession,
-    UpdateCompositionSession,
+    RefreshCaretSession, UpdateCompositionSession,
 };
 use crate::globals::{dll_add_ref, dll_module_path, dll_release, next_session_id};
 use crate::guids::active_guids;
@@ -126,7 +128,19 @@ struct TextServiceState {
     last_context_text: String,
     candidate_wnd: Option<CandidateWindow>,
     last_caret_rect: Option<RECT>,
+    /// Context currently observed through `ITfTextLayoutSink` and its advise cookie.
+    layout_sink: Option<(ITfContext, u32)>,
     lang_bar_btn: Option<ComObject<LangBarModeButton>>,
+}
+
+fn unadvise_layout_sink(sink: Option<(ITfContext, u32)>) {
+    if let Some((ctx, cookie)) = sink {
+        if let Ok(src) = ctx.cast::<ITfSource>() {
+            unsafe {
+                let _ = src.UnadviseSink(cookie);
+            }
+        }
+    }
 }
 
 impl TextServiceState {
@@ -153,6 +167,7 @@ impl TextServiceState {
             last_context_text: String::new(),
             candidate_wnd: None,
             last_caret_rect: None,
+            layout_sink: None,
             lang_bar_btn: None,
         }
     }
@@ -299,7 +314,8 @@ impl TextServiceState {
     ITfThreadMgrEventSink,
     ITfCompositionSink,
     ITfDisplayAttributeProvider,
-    ITfCompartmentEventSink
+    ITfCompartmentEventSink,
+    ITfTextLayoutSink
 )]
 pub struct TextService {
     inner: Rc<RefCell<TextServiceState>>,
@@ -314,6 +330,8 @@ impl TextService {
     }
 
     fn deactivate_internal(&self) {
+        let layout_sink = self.inner.borrow_mut().layout_sink.take();
+        unadvise_layout_sink(layout_sink);
         let (tm_opt, tid, tm_cookie, comp_cookie, lang_bar_btn, session_id) = {
             let mut st = self.inner.borrow_mut();
             st.session.on_focus_change();
@@ -477,6 +495,38 @@ impl TextService {
 }
 
 impl TextService_Impl {
+    /// Observe layout changes of `context` so the candidate window follows the composition once the
+    /// host has actually laid it out (the first `GetTextExt` after focusing a window is often stale).
+    fn ensure_layout_sink(&self, context: &ITfContext) {
+        let same = self
+            .inner
+            .borrow()
+            .layout_sink
+            .as_ref()
+            .is_some_and(|(c, _)| c.as_raw() == context.as_raw());
+        if same {
+            return;
+        }
+        let old = self.inner.borrow_mut().layout_sink.take();
+        unadvise_layout_sink(old);
+        let Ok(src) = context.cast::<ITfSource>() else {
+            return;
+        };
+        let sink: ITfTextLayoutSink = self.to_interface();
+        match unsafe { src.AdviseSink(&ITfTextLayoutSink::IID, &sink) } {
+            Ok(cookie) => {
+                self.inner.borrow_mut().layout_sink = Some((context.clone(), cookie));
+            }
+            Err(e) => {
+                tsf_log!(
+                    "caret",
+                    "AdviseSink(TextLayout) failed hr=0x{:08x}",
+                    e.code().0 as u32
+                );
+            }
+        }
+    }
+
     fn activate_impl(&self, ptim: Ref<ITfThreadMgr>, tid: u32, dwflags: u32) -> Result<()> {
         let tm = ptim.ok()?.clone();
         self.deactivate_internal();
@@ -825,6 +875,7 @@ impl TextService_Impl {
                         st.session_id,
                     )
                 };
+                self.ensure_layout_sink(context);
                 let (ok, pre_ctx) = self.run_update_composition(context, inline_preedit);
                 if !ok {
                     let mut st = self.inner.borrow_mut();
@@ -1260,6 +1311,8 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         pdimfocus: Ref<ITfDocumentMgr>,
         pdimprevfocus: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
+        let layout_sink = self.inner.borrow_mut().layout_sink.take();
+        unadvise_layout_sink(layout_sink);
         if let Some(prev_dm) = pdimprevfocus.as_ref() {
             if let Ok(prev_ctx) = unsafe { prev_dm.GetTop() } {
                 self.run_cancel_composition(&prev_ctx, false);
@@ -1330,6 +1383,49 @@ impl ITfCompositionSink_Impl for TextService_Impl {
         st.hide_candidate_window();
         drop(st);
         tsf_log!("comp", "OnCompositionTerminated ecwrite={ecwrite}");
+        Ok(())
+    }
+}
+
+impl ITfTextLayoutSink_Impl for TextService_Impl {
+    fn OnLayoutChange(
+        &self,
+        pic: Ref<ITfContext>,
+        lcode: TfLayoutCode,
+        _pview: Ref<ITfContextView>,
+    ) -> Result<()> {
+        if lcode == TF_LC_DESTROY {
+            return Ok(());
+        }
+        let Some(context) = pic.as_ref() else {
+            return Ok(());
+        };
+        let (tid, comp) = match self.inner.try_borrow() {
+            Ok(st) if st.session.is_composing() => {
+                let comp = st.composition.try_borrow().ok().and_then(|c| c.clone());
+                (st.tid, comp)
+            }
+            _ => return Ok(()),
+        };
+        let Some(comp) = comp else {
+            return Ok(());
+        };
+        let weak = Rc::downgrade(&self.inner);
+        let on_rect: Box<dyn Fn(RECT)> = Box::new(move |rc: RECT| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let Ok(mut st) = inner.try_borrow_mut() else {
+                return;
+            };
+            if !st.session.is_composing() || st.last_caret_rect == Some(rc) {
+                return;
+            }
+            st.last_caret_rect = Some(rc);
+            st.render_candidates();
+        });
+        let sess: ITfEditSession = RefreshCaretSession::new(context.clone(), comp, on_rect).into();
+        let _ = unsafe { context.RequestEditSession(tid, &sess, TF_ES_ASYNCDONTCARE | TF_ES_READ) };
         Ok(())
     }
 }

@@ -4,17 +4,22 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Variant::{
     VariantClear, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4,
 };
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
+    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfContextView,
+    ITfEditSession,
     ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE,
     INSERT_TEXT_AT_SELECTION_FLAGS, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START,
     TF_DEFAULT_SELECTION, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindowRect, GA_ROOT};
 use windows_core::{implement, BOOL, Interface, Result};
+
+use crate::debug_log::tsf_log;
 
 fn get_anchor_range(
     context: &ITfContext,
@@ -52,15 +57,101 @@ fn set_selection_to_end(context: &ITfContext, ec: u32, range: &ITfRange) -> Resu
     res
 }
 
+fn near(a: i32, b: i32) -> bool {
+    (a - b).abs() <= 1
+}
+
+/// Some hosts (Chromium/Electron, WPF, several Win32 frameworks) answer `GetTextExt` for a freshly
+/// focused document or a just-inserted composition before laying it out, and report the screen
+/// origin of the view window (client or frame top-left) instead of the real text position. Treat
+/// such a rect as "no layout yet" so the candidate window never jumps to the window's corner.
+fn is_window_origin_placeholder(view: &ITfContextView, rc: &RECT) -> bool {
+    let hwnd = match unsafe { view.GetWnd() } {
+        Ok(h) if !h.0.is_null() => h,
+        _ => return false,
+    };
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let candidates: [Option<HWND>; 2] = [
+        Some(hwnd),
+        (!root.0.is_null() && root != hwnd).then_some(root),
+    ];
+    for w in candidates.into_iter().flatten() {
+        let mut wr = RECT::default();
+        if unsafe { GetWindowRect(w, &mut wr) }.is_ok() && near(rc.left, wr.left) && near(rc.top, wr.top)
+        {
+            return true;
+        }
+        let mut origin = POINT::default();
+        if unsafe { ClientToScreen(w, &mut origin) }.as_bool()
+            && near(rc.left, origin.x)
+            && near(rc.top, origin.y)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn get_caret_rect(context: &ITfContext, ec: u32, range: &ITfRange) -> Option<RECT> {
     let view = unsafe { context.GetActiveView() }.ok()?;
     let mut rc = RECT::default();
     let mut clipped = BOOL(0);
-    unsafe { view.GetTextExt(ec, range, &mut rc, &mut clipped).ok()? };
-    if rc.left == 0 && rc.right == 0 && rc.top == 0 && rc.bottom == 0 {
-        None
-    } else {
-        Some(rc)
+    if let Err(e) = unsafe { view.GetTextExt(ec, range, &mut rc, &mut clipped) } {
+        tsf_log!("caret", "GetTextExt failed hr=0x{:08x}", e.code().0 as u32);
+        return None;
+    }
+    if rc == RECT::default() {
+        tsf_log!("caret", "GetTextExt returned empty rect");
+        return None;
+    }
+    if is_window_origin_placeholder(&view, &rc) {
+        tsf_log!(
+            "caret",
+            "GetTextExt rejected window-origin placeholder rc=({},{},{},{})",
+            rc.left,
+            rc.top,
+            rc.right,
+            rc.bottom
+        );
+        return None;
+    }
+    tsf_log!(
+        "caret",
+        "GetTextExt rc=({},{},{},{}) clipped={}",
+        rc.left,
+        rc.top,
+        rc.right,
+        rc.bottom,
+        clipped.as_bool()
+    );
+    Some(rc)
+}
+
+/// Read-only session that re-measures the live composition after the host reports a layout change.
+#[implement(ITfEditSession)]
+pub struct RefreshCaretSession {
+    context: ITfContext,
+    composition: ITfComposition,
+    on_rect: Box<dyn Fn(RECT)>,
+}
+
+impl RefreshCaretSession {
+    pub fn new(context: ITfContext, composition: ITfComposition, on_rect: Box<dyn Fn(RECT)>) -> Self {
+        Self {
+            context,
+            composition,
+            on_rect,
+        }
+    }
+}
+
+impl ITfEditSession_Impl for RefreshCaretSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let range = unsafe { self.composition.GetRange()? };
+        if let Some(rc) = get_caret_rect(&self.context, ec, &range) {
+            (self.on_rect)(rc);
+        }
+        Ok(())
     }
 }
 

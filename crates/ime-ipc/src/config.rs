@@ -49,6 +49,8 @@ pub struct ImeConfig {
     pub show_preedit_caret: bool,
     pub show_mode_toast: bool,
     pub default_chinese_punct: bool,
+    pub smart_english_punct: bool,
+    pub underscore_halfwidth: bool,
     pub shift_toggle: bool,
     pub initial_upper_english: bool,
     pub learning_enabled: bool,
@@ -68,6 +70,8 @@ impl Default for ImeConfig {
             show_preedit_caret: true,
             show_mode_toast: true,
             default_chinese_punct: true,
+            smart_english_punct: true,
+            underscore_halfwidth: true,
             shift_toggle: true,
             initial_upper_english: true,
             learning_enabled: true,
@@ -144,6 +148,8 @@ mod tests {
         let legacy = r#"{"theme":"auto","layout":"horizontal","page_size":5,"learning_enabled":true}"#;
         let parsed = serde_json::from_str::<ImeConfig>(legacy).unwrap().normalized();
         assert!(!parsed.cs_ai_boost);
+        assert!(parsed.smart_english_punct);
+        assert!(parsed.underscore_halfwidth);
         assert!(parsed.learning_enabled);
         assert_eq!(parsed.page_size, 5);
     }

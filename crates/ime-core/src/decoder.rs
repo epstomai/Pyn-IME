@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use crate::model::{ContextState, LexEntry, Model, EOS_ID, NONE_ID};
 use crate::pinyin::{
-    build_dag, pack_abbrev_tail, pack_exact, pack_initials, syllable_matches_digraph,
-    DagEdgeKind, PinyinDag, SpanPron, SYLLABLES,
+    build_dag, build_dag_with_abbrev, is_standard_pinyin_prefix, pack_abbrev_tail, pack_exact,
+    pack_initials, syllable_matches_digraph, syllable_str, DagEdgeKind, PinyinDag, SpanPron,
+    SYLLABLES,
 };
 use crate::reranker::Reranker;
 use crate::user_dict::{ActiveKeyMatch, UserMemory};
@@ -391,9 +392,68 @@ pub fn decode_rich_with_user(
     }
 
     // 3. Multi-syllable input: run Beam Search once and assemble 3-tier cascade.
-    let beam_res = run_beam_search(model, &dag, &ctx, active_user, &spans_to, &oov_pool, cfg);
+    let mut dag = dag;
+    let mut spans_to = spans_to;
+    let mut oov_pool = oov_pool;
+    let mut beam_res = run_beam_search(model, &dag, &ctx, active_user, &spans_to, &oov_pool, cfg);
     let mut rev_buf = Vec::with_capacity(dag.len + 2);
+
+    // Rescue false exact splits caused by unjoined zero-initial syllables (e.g. `yuang` -> `yu+ang`
+    // instead of `yuan+g`, or `yuangcheng` -> `yu+ang+cheng` instead of `yuan+g+cheng`).
+    let mut exact_fallback_top1: Option<String> = None;
+    if dag.exact_only
+        && !beam_res.beams[dag.len].is_empty()
+        && has_unjoined_zero_initial_syllable(&dag, &beam_res)
+    {
+        let alt_dag = build_dag_with_abbrev(keys);
+        let (alt_spans_to, alt_oov_pool) = collect_spans(model, &alt_dag, active_user, cfg);
+        let alt_beam_res = run_beam_search(
+            model,
+            &alt_dag,
+            &ctx,
+            active_user,
+            &alt_spans_to,
+            &alt_oov_pool,
+            cfg,
+        );
+        if !alt_beam_res.beams[alt_dag.len].is_empty()
+            && best_path_has_multi_char_word(model, &alt_beam_res, alt_dag.len)
+        {
+            if let Some(best_exact) = beam_res.beams[dag.len]
+                .iter()
+                .max_by(|a, b| a.total_score().total_cmp(&b.total_score()))
+            {
+                let mut text = String::new();
+                materialize_chain(
+                    &beam_res.nodes,
+                    best_exact.node_idx,
+                    None,
+                    model,
+                    &oov_pool,
+                    &mut rev_buf,
+                    &mut text,
+                );
+                if !text.is_empty() {
+                    exact_fallback_top1 = Some(text);
+                }
+            }
+            dag = alt_dag;
+            spans_to = alt_spans_to;
+            oov_pool = alt_oov_pool;
+            beam_res = alt_beam_res;
+        }
+    }
+
     let finals = &beam_res.beams[dag.len];
+    if finals.is_empty() || is_likely_non_pinyin(model, &dag, &beam_res, &oov_pool, keys) {
+        return RichDecodeOutcome {
+            items: Vec::new(),
+            base_top1: None,
+            segmented_preedit: keys.to_owned(),
+            first_char_offset: None,
+            first_syllable_len: 0,
+        };
+    }
 
     let syl_bounds = extract_best_syllable_bounds(model, &dag, &beam_res);
     let seg_ends: Vec<usize> = syl_bounds.iter().map(|&(_, e)| e).collect();
@@ -415,7 +475,7 @@ pub fn decode_rich_with_user(
     let mut items: Vec<CandidateItem> = Vec::with_capacity(limit.min(64));
     let mut seen_items: HashSet<(String, usize)> = HashSet::new();
 
-    // Tier 1: concise full-span candidates.
+    // Tier 1: concise full-span candidates (keep up to 3 so multi-word #3 e.g. `原工程` surfaces on page 1).
     let mut base_top1 = None;
     if !finals.is_empty() {
         let scored = score_beam_candidates(
@@ -428,19 +488,11 @@ pub fn decode_rich_with_user(
         );
         let full_want = limit.min(10).max(3);
         let mut full_outcome = finalize_candidates(reranker, context_text, scored, full_want, cfg);
-        let had_staged = apply_staged_oov_for_dag(&dag, active_user, full_want, &mut full_outcome);
+        let _had_staged = apply_staged_oov_for_dag(&dag, active_user, full_want, &mut full_outcome);
         base_top1 = full_outcome.base_top1;
 
-        let has_full_lex_word = had_staged
-            || spans_to[dag.len].iter().any(|sp| {
-                sp.start == 0
-                    && match sp.word {
-                        SpanWord::Model(wid) => model.word_str(wid).chars().count() >= 2,
-                        SpanWord::UserOov(_) => true,
-                    }
-            });
-        let max_full = if has_full_lex_word { 3 } else { 2 };
-        for text in full_outcome.candidates.into_iter().take(max_full) {
+        const MAX_FULL: usize = 3;
+        for text in full_outcome.candidates.into_iter().take(MAX_FULL) {
             if items.len() >= limit {
                 break;
             }
@@ -450,6 +502,17 @@ pub fn decode_rich_with_user(
                     consumed_len: keys.len(),
                     kind: CandidateKind::Full,
                 });
+            }
+        }
+        if items.len() < MAX_FULL && items.len() < limit {
+            if let Some(exact_top) = exact_fallback_top1 {
+                if seen_items.insert((exact_top.clone(), keys.len())) {
+                    items.push(CandidateItem {
+                        text: exact_top,
+                        consumed_len: keys.len(),
+                        kind: CandidateKind::Full,
+                    });
+                }
             }
         }
     }
@@ -526,7 +589,17 @@ pub fn decode_rich_with_user(
             }
         }
 
-        if added_for_len == 0 && syl_count == 2 && !beam_res.beams[end].is_empty() {
+        let crosses_explicit = (1..end).any(|p| {
+            dag.explicit_boundary_before
+                .get(p)
+                .copied()
+                .unwrap_or(false)
+        });
+        if added_for_len == 0
+            && syl_count == 2
+            && !crosses_explicit
+            && !beam_res.beams[end].is_empty()
+        {
             let mut beam_cands: Vec<(f32, String)> = beam_res.beams[end]
                 .iter()
                 .map(|hyp| {
@@ -642,6 +715,257 @@ pub fn decode_rich_with_user(
         first_char_offset,
         first_syllable_len,
     }
+}
+
+fn has_unjoined_zero_initial_syllable(dag: &PinyinDag, beam_res: &BeamSearchResult) -> bool {
+    let Some(best_hyp) = beam_res.beams[dag.len]
+        .iter()
+        .max_by(|a, b| a.total_score().total_cmp(&b.total_score()))
+    else {
+        return false;
+    };
+    let mut cur = best_hyp.node_idx;
+    while cur != u32::MAX {
+        let node = &beam_res.nodes[cur as usize];
+        if node.start > 0
+            && !dag
+                .explicit_boundary_before
+                .get(node.start as usize)
+                .copied()
+                .unwrap_or(false)
+        {
+            if let SpanPron::Exact { len: 1, syls } = node.pron {
+                if let Some(&first_b) = syllable_str(syls[0]).as_bytes().first() {
+                    if matches!(first_b, b'a' | b'e' | b'o') {
+                        return true;
+                    }
+                }
+            }
+        }
+        cur = node.parent;
+    }
+    false
+}
+
+fn best_path_has_multi_char_word(
+    model: &Model,
+    beam_res: &BeamSearchResult,
+    dag_len: usize,
+) -> bool {
+    let Some(best_hyp) = beam_res.beams[dag_len]
+        .iter()
+        .max_by(|a, b| a.total_score().total_cmp(&b.total_score()))
+    else {
+        return false;
+    };
+    let mut cur = best_hyp.node_idx;
+    while cur != u32::MAX {
+        let node = &beam_res.nodes[cur as usize];
+        match node.word {
+            SpanWord::Model(wid) => {
+                if model.word_str(wid).chars().count() >= 2 {
+                    return true;
+                }
+            }
+            SpanWord::UserOov(_) => return true,
+        }
+        cur = node.parent;
+    }
+    false
+}
+
+/// Detects non-exact sequences that only parse via implausible abbrev + bare-vowel chains or
+/// fragmented low-LM-score spans (such as English words `liltoon`, `nilotoon`, `python`), while
+/// strictly preserving exact pinyin, apostrophe-separated input, and valid Chinese abbreviations.
+fn is_likely_non_pinyin(
+    model: &Model,
+    dag: &PinyinDag,
+    beam_res: &BeamSearchResult,
+    oov_pool: &[String],
+    keys: &str,
+) -> bool {
+    if dag.exact_only || dag.len <= 3 || keys.contains('\'') {
+        return false;
+    }
+    let Some(best_hyp) = beam_res.beams[dag.len]
+        .iter()
+        .max_by(|a, b| a.total_score().total_cmp(&b.total_score()))
+    else {
+        return true;
+    };
+
+    let mut chain: Vec<&BackNode> = Vec::new();
+    let mut cur = best_hyp.node_idx;
+    while cur != u32::MAX {
+        let node = &beam_res.nodes[cur as usize];
+        chain.push(node);
+        cur = node.parent;
+    }
+    chain.reverse();
+
+    let mut total_chars = 0usize;
+    let mut abbrev_span_count = 0usize;
+    let mut weak_1char_count = 0usize;
+    let mut units: Vec<DagEdgeKind> = Vec::with_capacity(dag.len);
+
+    for node in chain {
+        let span_chars = match node.word {
+            SpanWord::Model(wid) => model.word_str(wid).chars().count(),
+            SpanWord::UserOov(idx) => oov_pool[idx].chars().count(),
+        };
+        total_chars += span_chars;
+        if !matches!(node.pron, SpanPron::Exact { .. }) {
+            abbrev_span_count += 1;
+        }
+        if span_chars == 1 {
+            let is_weak = match node.pron {
+                SpanPron::AbbrevInit { len: 1, .. } => true,
+                SpanPron::Exact { len: 1, syls } => {
+                    matches!(syllable_str(syls[0]), "a" | "e" | "o" | "lo")
+                }
+                _ => false,
+            };
+            if is_weak {
+                weak_1char_count += 1;
+            }
+        }
+        match node.pron {
+            SpanPron::Exact { len, syls } => {
+                for &syl in &syls[..len as usize] {
+                    units.push(DagEdgeKind::Exact(syl));
+                }
+            }
+            SpanPron::AbbrevTail {
+                prefix_len,
+                prefix,
+                last_letter,
+            } => {
+                for &syl in &prefix[..prefix_len as usize] {
+                    units.push(DagEdgeKind::Exact(syl));
+                }
+                units.push(DagEdgeKind::Abbrev(last_letter));
+            }
+            SpanPron::AbbrevInit { len, letters } => {
+                for &lt in &letters[..len as usize] {
+                    units.push(DagEdgeKind::Abbrev(lt));
+                }
+            }
+            SpanPron::Mixed { len, units: u } => {
+                units.extend_from_slice(&u[..len as usize]);
+            }
+        }
+    }
+
+    let is_bare_o = |u: DagEdgeKind| match u {
+        DagEdgeKind::Exact(s) => syllable_str(s) == "o",
+        DagEdgeKind::Abbrev(lt) => lt + b'a' == b'o',
+        DagEdgeKind::Abbrev2(_) => false,
+    };
+    let is_bare_vowel = |u: DagEdgeKind| {
+        is_bare_o(u)
+            || matches!(u, DagEdgeKind::Exact(s) if matches!(syllable_str(s), "a" | "e"))
+    };
+    let is_exact_normal = |u: DagEdgeKind| {
+        matches!(u, DagEdgeKind::Exact(s) if {
+            let ss = syllable_str(s);
+            ss.len() >= 2 && ss != "lo"
+        })
+    };
+
+    let mut abbrev_units = 0usize;
+    let mut exact_normal_units = 0usize;
+    let mut bare_vowel_units = 0usize;
+    let mut bare_o_units = 0usize;
+    let mut has_rare_lo = false;
+    let mut has_digraph_abbrev = false;
+    let mut abbrev_runs = 0usize;
+    let mut in_abbrev_run = false;
+    for &u in &units {
+        if !matches!(u, DagEdgeKind::Exact(_)) {
+            abbrev_units += 1;
+            if matches!(u, DagEdgeKind::Abbrev2(_)) {
+                has_digraph_abbrev = true;
+            }
+            if !in_abbrev_run {
+                abbrev_runs += 1;
+                in_abbrev_run = true;
+            }
+        } else {
+            in_abbrev_run = false;
+            if matches!(u, DagEdgeKind::Exact(s) if syllable_str(s) == "lo") {
+                has_rare_lo = true;
+            } else if is_exact_normal(u) {
+                exact_normal_units += 1;
+            }
+        }
+        if is_bare_vowel(u) {
+            bare_vowel_units += 1;
+            if is_bare_o(u) {
+                bare_o_units += 1;
+            }
+        }
+    }
+
+    let mut has_consecutive_bare_vowels = false;
+    let mut has_lo_or_fo_then_o = false;
+    let mut has_abbrev_then_bare_vowel = false;
+    for w in units.windows(2) {
+        if is_bare_vowel(w[0]) && is_bare_vowel(w[1]) {
+            has_consecutive_bare_vowels = true;
+        }
+        if let DagEdgeKind::Exact(s1) = w[0] {
+            if matches!(syllable_str(s1), "lo" | "fo") && is_bare_o(w[1]) {
+                has_lo_or_fo_then_o = true;
+            }
+        }
+        if !matches!(w[0], DagEdgeKind::Exact(_)) && is_bare_vowel(w[1]) {
+            has_abbrev_then_bare_vowel = true;
+        }
+    }
+
+    if has_consecutive_bare_vowels || has_lo_or_fo_then_o {
+        return true;
+    }
+    if is_standard_pinyin_prefix(keys) {
+        return false;
+    }
+    if has_abbrev_then_bare_vowel || has_rare_lo {
+        return true;
+    }
+    if exact_normal_units == 0 && bare_vowel_units >= 1 {
+        return true;
+    }
+    let lm_per_char = best_hyp.lm_score / (total_chars.max(1) as f32);
+    if exact_normal_units >= 1 && dag.len >= 5 {
+        if bare_o_units >= 1 {
+            return true;
+        }
+        if bare_vowel_units >= 1 && (abbrev_units >= 2 || weak_1char_count >= 1) {
+            return true;
+        }
+        if !has_digraph_abbrev && abbrev_span_count >= 2 {
+            if weak_1char_count >= 2 {
+                return true;
+            }
+            if weak_1char_count >= 1
+                && (abbrev_runs >= 2
+                    || (exact_normal_units == 1 && abbrev_units >= 3)
+                    || lm_per_char < -4.4)
+            {
+                return true;
+            }
+            if abbrev_span_count >= 3 && lm_per_char < -4.5 {
+                return true;
+            }
+            if lm_per_char < -5.0 {
+                return true;
+            }
+        }
+        if weak_1char_count >= 2 && lm_per_char < -5.5 {
+            return true;
+        }
+    }
+    false
 }
 
 struct BeamSearchResult {
@@ -1510,6 +1834,7 @@ fn collect_spans(
         units: [DagEdgeKind; 6],
         abbrev_count: u8,
         has_abbrev2: bool,
+        crossed_explicit_sep: bool,
         mixed_buf: &mut Vec<LexEntry>,
         spans_to: &mut Vec<Vec<SpanEdge>>,
         oov_pool: &mut Vec<String>,
@@ -1517,6 +1842,13 @@ fn collect_spans(
         if pos >= dag.len {
             return;
         }
+        let next_crossed = crossed_explicit_sep
+            || (len >= 1
+                && dag
+                    .explicit_boundary_before
+                    .get(pos)
+                    .copied()
+                    .unwrap_or(false));
         for edge in &dag.edges_from[pos] {
             let is_single_abbrev = matches!(edge.kind, DagEdgeKind::Abbrev(_));
             if len >= MAX_MIXED_LEN
@@ -1529,6 +1861,9 @@ fn collect_spans(
             let mut next_units = units;
             next_units[len] = edge.kind;
             let next_abbrev = abbrev_count + u8::from(!matches!(edge.kind, DagEdgeKind::Exact(_)));
+            if next_crossed && next_abbrev > 0 {
+                continue;
+            }
             let next_has_abbrev2 = has_abbrev2 || matches!(edge.kind, DagEdgeKind::Abbrev2(_));
 
             if next_len == 1 {
@@ -1586,6 +1921,7 @@ fn collect_spans(
                     next_units,
                     next_abbrev,
                     next_has_abbrev2,
+                    next_crossed,
                     mixed_buf,
                     spans_to,
                     oov_pool,
@@ -1649,6 +1985,7 @@ fn collect_spans(
                         next_units,
                         next_abbrev,
                         next_has_abbrev2,
+                        next_crossed,
                         mixed_buf,
                         spans_to,
                         oov_pool,
@@ -1691,6 +2028,7 @@ fn collect_spans(
                         next_units,
                         next_abbrev,
                         next_has_abbrev2,
+                        next_crossed,
                         mixed_buf,
                         spans_to,
                         oov_pool,
@@ -1736,6 +2074,7 @@ fn collect_spans(
                         next_units,
                         next_abbrev,
                         next_has_abbrev2,
+                        next_crossed,
                         mixed_buf,
                         spans_to,
                         oov_pool,
@@ -1770,6 +2109,7 @@ fn collect_spans(
                         next_units,
                         next_abbrev,
                         next_has_abbrev2,
+                        next_crossed,
                         mixed_buf,
                         spans_to,
                         oov_pool,
@@ -1791,6 +2131,7 @@ fn collect_spans(
             0,
             init_units,
             0,
+            false,
             false,
             &mut mixed_buf,
             &mut spans_to,

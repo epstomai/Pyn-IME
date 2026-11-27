@@ -57,7 +57,7 @@ const CLASS_NAME: &str = "PynSettingsWnd";
 const WINDOW_TITLE: &str = "Pyn 设置";
 const MUTEX_NAME: &str = r"Local\PynSettingsMutex_v1";
 const LOGICAL_W: i32 = 580;
-const LOGICAL_H: i32 = 812;
+const LOGICAL_H: i32 = 856;
 
 const CURATED_CJK_FONTS: &[&str] = &[
     "MiSans",
@@ -420,6 +420,8 @@ enum ControlAction {
     PageSizeDec,
     PageSizeInc,
     ToggleDefaultPunct,
+    ToggleSmartEnglishPunct,
+    ToggleUnderscoreHalfwidth,
     ToggleShift,
     ToggleInitialUpper,
     ToggleCaret,
@@ -1265,6 +1267,8 @@ unsafe fn render_settings_surface(
 
     let toggle_rows = [
         ("默认中文标点（Ctrl + . 切换）", state.config.default_chinese_punct, ControlAction::ToggleDefaultPunct),
+        ("智能英文符号（数字/英文/空格后半角）", state.config.smart_english_punct, ControlAction::ToggleSmartEnglishPunct),
+        ("_ 直接输出英文下划线", state.config.underscore_halfwidth, ControlAction::ToggleUnderscoreHalfwidth),
         ("单击 Shift 切换中英文", state.config.shift_toggle, ControlAction::ToggleShift),
         ("首字母大写进入英文组合", state.config.initial_upper_english, ControlAction::ToggleInitialUpper),
         ("显示拼音输入光标", state.config.show_preedit_caret, ControlAction::ToggleCaret),
@@ -1272,8 +1276,8 @@ unsafe fn render_settings_surface(
         ("启用本地词频自学习", state.config.learning_enabled, ControlAction::ToggleLearning),
         ("CS / AI 术语优先", state.config.cs_ai_boost, ControlAction::ToggleCsAiBoost),
     ];
-    let t_row_h = px(32);
-    let dict_row_h = px(34);
+    let t_row_h = px(30);
+    let dict_row_h = px(32);
     let card3_h = t_row_h * (toggle_rows.len() as i32) + dict_row_h;
     draw_aa_rounded_rect(
         pixels,
@@ -2540,6 +2544,14 @@ unsafe fn handle_click(hwnd: HWND, state: &mut AppState, x: i32, y: i32) {
         }
         ControlAction::ToggleDefaultPunct => {
             state.config.default_chinese_punct = !state.config.default_chinese_punct;
+            state.persist_and_push();
+        }
+        ControlAction::ToggleSmartEnglishPunct => {
+            state.config.smart_english_punct = !state.config.smart_english_punct;
+            state.persist_and_push();
+        }
+        ControlAction::ToggleUnderscoreHalfwidth => {
+            state.config.underscore_halfwidth = !state.config.underscore_halfwidth;
             state.persist_and_push();
         }
         ControlAction::ToggleShift => {

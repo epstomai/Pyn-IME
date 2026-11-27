@@ -1168,12 +1168,12 @@ mod tests {
         assert!(xian_out.items.iter().any(|it| it.text == "西安"));
         assert!(xian_out.items.iter().any(|it| it.text == "西"));
 
-        // B. `jialichuang` cascade: concise full (<=2 since no 3-char word), prefix words (`家里`/`嘉利`), then all `jia` single chars (`嘉`).
+        // B. `jialichuang` cascade: concise full (<=3), prefix words (`家里`/`嘉利`), then all `jia` single chars (`嘉`).
         let jlc_out = decode_rich_with_user(&model, None, None, "jialichuang", "", 250, &cfg);
         assert_eq!(jlc_out.segmented_preedit, "jia'li'chuang");
         assert_eq!(jlc_out.first_syllable_len, 3);
         let full_cnt = jlc_out.items.iter().filter(|it| it.kind == CandidateKind::Full).count();
-        assert!(full_cnt <= 2);
+        assert!(full_cnt <= 3);
         let prefix_words: Vec<&str> = jlc_out
             .items
             .iter()
@@ -1197,5 +1197,475 @@ mod tests {
         engine.commit("嘉立创");
         let after_2 = engine.convert("jialichuang", 50);
         assert_eq!(after_2.first().map(String::as_str), Some("嘉立创"));
+    }
+
+    #[test]
+    fn explicit_apostrophe_blocks_abbrev_cross_join_and_rescues_zero_initial_false_exact() {
+        use crate::decoder::{decode_rich_with_user, CandidateKind};
+
+        let words = [
+            "<bos>", "<eos>", "<pause>", "原", "员", "告", "工", "称", "程", "与", "昂",
+            "方", "案", "西", "安", "员工", "原告", "工程", "方案", "西安", "原工程", "员工称",
+        ];
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        let mut word_bytes = Vec::new();
+        for w in &words {
+            word_offsets.push(word_bytes.len() as u32);
+            word_bytes.extend_from_slice(w.as_bytes());
+        }
+        word_offsets.push(word_bytes.len() as u32);
+
+        let n = words.len();
+        let mut unigram_logp = vec![-7.0_f32; n];
+        unigram_logp[EOS_ID as usize] = -2.0;
+        unigram_logp[PAUSE_ID as usize] = -2.5;
+        unigram_logp[3] = -2.5; // 原
+        unigram_logp[4] = -3.0; // 员
+        unigram_logp[5] = -3.5; // 告
+        unigram_logp[6] = -3.0; // 工
+        unigram_logp[7] = -3.2; // 称
+        unigram_logp[8] = -3.4; // 程
+        unigram_logp[9] = -2.6; // 与
+        unigram_logp[10] = -5.5; // 昂
+        unigram_logp[11] = -2.8; // 方
+        unigram_logp[12] = -3.2; // 案
+        unigram_logp[13] = -2.8; // 西
+        unigram_logp[14] = -3.0; // 安
+        unigram_logp[15] = -1.6; // 员工
+        unigram_logp[16] = -1.8; // 原告
+        unigram_logp[17] = -1.7; // 工程
+        unigram_logp[18] = -1.5; // 方案
+        unigram_logp[19] = -1.5; // 西安
+        unigram_logp[20] = -4.0; // 原工程
+        unigram_logp[21] = -3.0; // 员工称
+        let unigram_bow = vec![-0.2_f32; n];
+
+        let yuan = syllable_id("yuan").unwrap();
+        let yu = syllable_id("yu").unwrap();
+        let ang = syllable_id("ang").unwrap();
+        let gong = syllable_id("gong").unwrap();
+        let gao = syllable_id("gao").unwrap();
+        let cheng = syllable_id("cheng").unwrap();
+        let fang = syllable_id("fang").unwrap();
+        let an = syllable_id("an").unwrap();
+        let xi = syllable_id("xi").unwrap();
+
+        let exact = build_lex_table(
+            vec![
+                (pack_exact(&[yuan]).unwrap(), LexEntry { word_id: 3, reading_logp: 0.0 }),
+                (pack_exact(&[yuan]).unwrap(), LexEntry { word_id: 4, reading_logp: -0.1 }),
+                (pack_exact(&[gao]).unwrap(), LexEntry { word_id: 5, reading_logp: 0.0 }),
+                (pack_exact(&[gong]).unwrap(), LexEntry { word_id: 6, reading_logp: 0.0 }),
+                (pack_exact(&[cheng]).unwrap(), LexEntry { word_id: 7, reading_logp: 0.0 }),
+                (pack_exact(&[cheng]).unwrap(), LexEntry { word_id: 8, reading_logp: -0.1 }),
+                (pack_exact(&[yu]).unwrap(), LexEntry { word_id: 9, reading_logp: 0.0 }),
+                (pack_exact(&[ang]).unwrap(), LexEntry { word_id: 10, reading_logp: 0.0 }),
+                (pack_exact(&[fang]).unwrap(), LexEntry { word_id: 11, reading_logp: 0.0 }),
+                (pack_exact(&[an]).unwrap(), LexEntry { word_id: 12, reading_logp: 0.0 }),
+                (pack_exact(&[xi]).unwrap(), LexEntry { word_id: 13, reading_logp: 0.0 }),
+                (pack_exact(&[an]).unwrap(), LexEntry { word_id: 14, reading_logp: 0.0 }),
+                (pack_exact(&[yuan, gong]).unwrap(), LexEntry { word_id: 15, reading_logp: 0.0 }),
+                (pack_exact(&[yuan, gao]).unwrap(), LexEntry { word_id: 16, reading_logp: 0.0 }),
+                (pack_exact(&[gong, cheng]).unwrap(), LexEntry { word_id: 17, reading_logp: 0.0 }),
+                (pack_exact(&[fang, an]).unwrap(), LexEntry { word_id: 18, reading_logp: 0.0 }),
+                (pack_exact(&[xi, an]).unwrap(), LexEntry { word_id: 19, reading_logp: 0.0 }),
+            ]
+            .into_iter(),
+        );
+
+        let mut initial_chars: [Vec<LexEntry>; 26] = std::array::from_fn(|_| Vec::new());
+        initial_chars[(b'g' - b'a') as usize] = vec![
+            LexEntry { word_id: 6, reading_logp: 0.0 },
+            LexEntry { word_id: 5, reading_logp: -0.1 },
+        ];
+        initial_chars[(b'c' - b'a') as usize] = vec![
+            LexEntry { word_id: 7, reading_logp: 0.0 },
+            LexEntry { word_id: 8, reading_logp: -0.1 },
+        ];
+
+        let abbrev_tail = build_lex_table(
+            vec![
+                (pack_abbrev_tail(&[yuan], b'g' - b'a').unwrap(), LexEntry { word_id: 15, reading_logp: 0.0 }),
+                (pack_abbrev_tail(&[yuan], b'g' - b'a').unwrap(), LexEntry { word_id: 16, reading_logp: -0.1 }),
+            ]
+            .into_iter(),
+        );
+        let abbrev_init = build_lex_table(
+            vec![
+                (pack_initials(&[b'g' - b'a', b'c' - b'a']).unwrap(), LexEntry { word_id: 17, reading_logp: 0.0 }),
+            ]
+            .into_iter(),
+        );
+
+        let mut bigram_offsets = vec![0u32; n + 1];
+        let mut bigram_w2 = Vec::new();
+        let mut bigram_logp = Vec::new();
+        let mut bigram_bow = Vec::new();
+        for w1 in 0..n {
+            bigram_offsets[w1] = bigram_w2.len() as u32;
+            match w1 {
+                0 => {
+                    bigram_w2.extend_from_slice(&[3, 15, 16, 18, 19]);
+                    bigram_logp.extend_from_slice(&[-1.5, -1.0, -1.2, -1.0, -1.0]);
+                    bigram_bow.extend_from_slice(&[-0.1; 5]);
+                }
+                3 => {
+                    bigram_w2.push(17);
+                    bigram_logp.push(-1.2);
+                    bigram_bow.push(-0.1);
+                }
+                15 | 16 => {
+                    bigram_w2.extend_from_slice(&[1, 7]);
+                    bigram_logp.extend_from_slice(&[-0.2, -1.5]);
+                    bigram_bow.extend_from_slice(&[-0.1, -0.1]);
+                }
+                7 | 10 | 17 | 18 | 19 => {
+                    bigram_w2.push(EOS_ID);
+                    bigram_logp.push(-0.2);
+                    bigram_bow.push(-0.1);
+                }
+                _ => {}
+            }
+        }
+        bigram_offsets[n] = bigram_w2.len() as u32;
+        let trigram_offsets = vec![0u32; bigram_w2.len() + 1];
+
+        let model = Model::from_parts(
+            word_offsets,
+            word_bytes,
+            unigram_logp,
+            unigram_bow,
+            exact,
+            initial_chars,
+            abbrev_tail,
+            abbrev_init,
+            bigram_offsets,
+            bigram_w2,
+            bigram_logp,
+            bigram_bow,
+            trigram_offsets,
+            Vec::new(),
+            Vec::new(),
+        );
+        let cfg = DecoderConfig::default();
+
+        // 1. `yuan'gc`: explicit `'` blocks abbrev span `yuan+g -> 员工/原告`, so `原工程` wins #1!
+        let sep_out = decode_rich_with_user(&model, None, None, "yuan'gc", "", 50, &cfg);
+        assert_eq!(sep_out.items.first().map(|x| x.text.as_str()), Some("原工程"));
+        assert!(!sep_out.items.iter().any(|x| x.text == "员工" || x.text == "原告"));
+
+        // Exact multi-char words with explicit `'` (`xi'an`, `fang'an`) still match cleanly.
+        let xian_sep = decode_rich_with_user(&model, None, None, "xi'an", "", 20, &cfg);
+        assert_eq!(xian_sep.items.first().map(|x| x.text.as_str()), Some("西安"));
+        let fangan_out = decode_rich_with_user(&model, None, None, "fangan", "", 20, &cfg);
+        assert_eq!(fangan_out.items.first().map(|x| x.text.as_str()), Some("方案"));
+
+        // 2. `yuang`: rescues false exact split `yu+ang` (`与昂`) into mixed `yuan+g` (`员工`, `原告`).
+        let yuang_out = decode_rich_with_user(&model, None, None, "yuang", "", 50, &cfg);
+        assert_eq!(yuang_out.segmented_preedit, "yuan'g");
+        assert_eq!(yuang_out.first_syllable_len, 4);
+        assert_eq!(yuang_out.items.first().map(|x| x.text.as_str()), Some("员工"));
+        assert!(yuang_out.items.iter().any(|x| x.text == "与昂" && x.kind == CandidateKind::Full));
+
+        // Explicit `yu'ang` respects user separator and stays `与昂`.
+        let yu_ang_out = decode_rich_with_user(&model, None, None, "yu'ang", "", 50, &cfg);
+        assert_eq!(yu_ang_out.items.first().map(|x| x.text.as_str()), Some("与昂"));
+    }
+
+    #[test]
+    fn rich_decode_suppresses_english_non_pinyin_without_hurting_chinese_abbrevs() {
+        use crate::decoder::decode_rich_with_user;
+        use crate::pinyin::is_standard_pinyin_prefix;
+
+        // 1. Standard pinyin prefix checks (mid-typing Chinese prefixes pass; English patterns fail).
+        for py_pref in [
+            "zhong", "zho", "zhon", "kulo", "kulon", "wozhon", "guangdon", "yuangc", "haod",
+        ] {
+            assert!(
+                is_standard_pinyin_prefix(py_pref),
+                "expected '{py_pref}' to be a valid standard pinyin prefix"
+            );
+        }
+        for non_py in [
+            "lilto", "liltoon", "niloto", "nilotoon", "config", "github", "python", "local",
+            "hello", "toon", "loop", "gjaq", "wlaq",
+        ] {
+            assert!(
+                !is_standard_pinyin_prefix(non_py),
+                "expected '{non_py}' NOT to be a standard pinyin prefix"
+            );
+        }
+
+        // 2. Toy model containing syllables + initials capable of forcing English strings (`liltoon`,
+        // `nilotoon`, `toon`) into nonsensical Chinese, alongside real Chinese abbrevs (`yuangc`,
+        // `gc`, `haod`, `zho`, `zhon`).
+        let words = [
+            "<bos>", "<eos>", "<pause>",
+            "立", "李", "老头", "天", "聊", "聊天", "哦", "你", "咯", "听",
+            "原", "员", "告", "工", "称", "程", "原告", "工程", "原工程", "员工", "原告称",
+            "好", "的", "好的", "中", "欧", "中欧", "呢", "从", "更", "与", "昂", "和",
+        ];
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        let mut word_bytes = Vec::new();
+        for w in &words {
+            word_offsets.push(word_bytes.len() as u32);
+            word_bytes.extend_from_slice(w.as_bytes());
+        }
+        word_offsets.push(word_bytes.len() as u32);
+
+        let n = words.len();
+        let mut unigram_logp = vec![-7.0_f32; n];
+        unigram_logp[EOS_ID as usize] = -2.0;
+        unigram_logp[PAUSE_ID as usize] = -2.5;
+        unigram_logp[3] = -4.5; // 立
+        unigram_logp[4] = -4.0; // 李
+        unigram_logp[5] = -5.0; // 老头
+        unigram_logp[6] = -3.8; // 天
+        unigram_logp[7] = -5.0; // 聊
+        unigram_logp[8] = -4.5; // 聊天
+        unigram_logp[9] = -6.0; // 哦
+        unigram_logp[10] = -2.2; // 你
+        unigram_logp[11] = -6.5; // 咯
+        unigram_logp[12] = -3.5; // 听
+        unigram_logp[13] = -2.5; // 原
+        unigram_logp[14] = -3.0; // 员
+        unigram_logp[15] = -3.5; // 告
+        unigram_logp[16] = -3.0; // 工
+        unigram_logp[17] = -3.2; // 称
+        unigram_logp[18] = -3.4; // 程
+        unigram_logp[19] = -1.8; // 原告
+        unigram_logp[20] = -1.7; // 工程
+        unigram_logp[21] = -3.5; // 原工程
+        unigram_logp[22] = -1.6; // 员工
+        unigram_logp[23] = -2.2; // 原告称
+        unigram_logp[24] = -2.2; // 好
+        unigram_logp[25] = -1.5; // 的
+        unigram_logp[26] = -1.5; // 好的
+        unigram_logp[27] = -2.0; // 中
+        unigram_logp[28] = -3.0; // 欧
+        unigram_logp[29] = -2.5; // 中欧
+        unigram_logp[30] = -3.5; // 呢
+        unigram_logp[31] = -2.8; // 从
+        unigram_logp[32] = -2.8; // 更
+        unigram_logp[33] = -2.6; // 与
+        unigram_logp[34] = -5.5; // 昂
+        unigram_logp[35] = -2.0; // 和
+        let unigram_bow = vec![-0.2_f32; n];
+
+        let li = syllable_id("li").unwrap();
+        let ni = syllable_id("ni").unwrap();
+        let lo = syllable_id("lo").unwrap();
+        let o = syllable_id("o").unwrap();
+        let liao = syllable_id("liao").unwrap();
+        let tian = syllable_id("tian").unwrap();
+        let yuan = syllable_id("yuan").unwrap();
+        let yu = syllable_id("yu").unwrap();
+        let ang = syllable_id("ang").unwrap();
+        let he = syllable_id("he").unwrap();
+        let gong = syllable_id("gong").unwrap();
+        let gao = syllable_id("gao").unwrap();
+        let cheng = syllable_id("cheng").unwrap();
+        let hao = syllable_id("hao").unwrap();
+        let de = syllable_id("de").unwrap();
+        let zhong = syllable_id("zhong").unwrap();
+        let ou = syllable_id("ou").unwrap();
+        let ne = syllable_id("ne").unwrap();
+        let cong = syllable_id("cong").unwrap();
+        let geng = syllable_id("geng").unwrap();
+
+        let exact = build_lex_table(
+            vec![
+                (pack_exact(&[li]).unwrap(), LexEntry { word_id: 3, reading_logp: 0.0 }),
+                (pack_exact(&[li]).unwrap(), LexEntry { word_id: 4, reading_logp: -0.1 }),
+                (pack_exact(&[o]).unwrap(), LexEntry { word_id: 9, reading_logp: 0.0 }),
+                (pack_exact(&[ni]).unwrap(), LexEntry { word_id: 10, reading_logp: 0.0 }),
+                (pack_exact(&[lo]).unwrap(), LexEntry { word_id: 11, reading_logp: 0.0 }),
+                (pack_exact(&[liao, tian]).unwrap(), LexEntry { word_id: 8, reading_logp: 0.0 }),
+                (pack_exact(&[yuan]).unwrap(), LexEntry { word_id: 13, reading_logp: 0.0 }),
+                (pack_exact(&[yuan]).unwrap(), LexEntry { word_id: 14, reading_logp: -0.1 }),
+                (pack_exact(&[gao]).unwrap(), LexEntry { word_id: 15, reading_logp: 0.0 }),
+                (pack_exact(&[gong]).unwrap(), LexEntry { word_id: 16, reading_logp: 0.0 }),
+                (pack_exact(&[cheng]).unwrap(), LexEntry { word_id: 17, reading_logp: 0.0 }),
+                (pack_exact(&[cheng]).unwrap(), LexEntry { word_id: 18, reading_logp: -0.1 }),
+                (pack_exact(&[yuan, gao]).unwrap(), LexEntry { word_id: 19, reading_logp: 0.0 }),
+                (pack_exact(&[gong, cheng]).unwrap(), LexEntry { word_id: 20, reading_logp: 0.0 }),
+                (pack_exact(&[yuan, gong]).unwrap(), LexEntry { word_id: 22, reading_logp: 0.0 }),
+                (pack_exact(&[yuan, gao, cheng]).unwrap(), LexEntry { word_id: 23, reading_logp: 0.0 }),
+                (pack_exact(&[hao]).unwrap(), LexEntry { word_id: 24, reading_logp: 0.0 }),
+                (pack_exact(&[de]).unwrap(), LexEntry { word_id: 25, reading_logp: 0.0 }),
+                (pack_exact(&[hao, de]).unwrap(), LexEntry { word_id: 26, reading_logp: 0.0 }),
+                (pack_exact(&[zhong]).unwrap(), LexEntry { word_id: 27, reading_logp: 0.0 }),
+                (pack_exact(&[ou]).unwrap(), LexEntry { word_id: 28, reading_logp: 0.0 }),
+                (pack_exact(&[zhong, ou]).unwrap(), LexEntry { word_id: 29, reading_logp: 0.0 }),
+                (pack_exact(&[ne]).unwrap(), LexEntry { word_id: 30, reading_logp: 0.0 }),
+                (pack_exact(&[cong]).unwrap(), LexEntry { word_id: 31, reading_logp: 0.0 }),
+                (pack_exact(&[geng]).unwrap(), LexEntry { word_id: 32, reading_logp: 0.0 }),
+                (pack_exact(&[yu]).unwrap(), LexEntry { word_id: 33, reading_logp: 0.0 }),
+                (pack_exact(&[ang]).unwrap(), LexEntry { word_id: 34, reading_logp: 0.0 }),
+                (pack_exact(&[he]).unwrap(), LexEntry { word_id: 35, reading_logp: 0.0 }),
+            ]
+            .into_iter(),
+        );
+
+        let mut initial_chars: [Vec<LexEntry>; 26] = std::array::from_fn(|_| Vec::new());
+        initial_chars[(b'l' - b'a') as usize] = vec![
+            LexEntry { word_id: 3, reading_logp: 0.0 },
+            LexEntry { word_id: 7, reading_logp: -0.1 },
+        ];
+        initial_chars[(b't' - b'a') as usize] = vec![
+            LexEntry { word_id: 6, reading_logp: 0.0 },
+            LexEntry { word_id: 12, reading_logp: -0.1 },
+        ];
+        initial_chars[(b'n' - b'a') as usize] = vec![
+            LexEntry { word_id: 10, reading_logp: 0.0 },
+            LexEntry { word_id: 30, reading_logp: -0.2 },
+        ];
+        initial_chars[(b'g' - b'a') as usize] = vec![
+            LexEntry { word_id: 32, reading_logp: 0.0 },
+            LexEntry { word_id: 16, reading_logp: -0.1 },
+        ];
+        initial_chars[(b'c' - b'a') as usize] = vec![
+            LexEntry { word_id: 31, reading_logp: 0.0 },
+            LexEntry { word_id: 17, reading_logp: -0.1 },
+        ];
+        initial_chars[(b'z' - b'a') as usize] = vec![
+            LexEntry { word_id: 27, reading_logp: 0.0 },
+        ];
+        initial_chars[(b'd' - b'a') as usize] = vec![
+            LexEntry { word_id: 25, reading_logp: 0.0 },
+        ];
+        initial_chars[(b'h' - b'a') as usize] = vec![
+            LexEntry { word_id: 35, reading_logp: 0.0 },
+        ];
+
+        let abbrev_tail = build_lex_table(
+            vec![
+                (pack_abbrev_tail(&[hao], b'd' - b'a').unwrap(), LexEntry { word_id: 26, reading_logp: 0.0 }),
+                (pack_abbrev_tail(&[yuan], b'g' - b'a').unwrap(), LexEntry { word_id: 19, reading_logp: 0.0 }),
+                (pack_abbrev_tail(&[yuan], b'g' - b'a').unwrap(), LexEntry { word_id: 22, reading_logp: -0.1 }),
+            ]
+            .into_iter(),
+        );
+        let abbrev_init = build_lex_table(
+            vec![
+                (pack_initials(&[b'g' - b'a', b'c' - b'a']).unwrap(), LexEntry { word_id: 20, reading_logp: 0.0 }),
+                (pack_initials(&[b'l' - b'a', b't' - b'a']).unwrap(), LexEntry { word_id: 8, reading_logp: 0.0 }),
+            ]
+            .into_iter(),
+        );
+
+        let mut bigram_offsets = vec![0u32; n + 1];
+        let mut bigram_w2 = Vec::new();
+        let mut bigram_logp = Vec::new();
+        let mut bigram_bow = Vec::new();
+        for w1 in 0..n {
+            bigram_offsets[w1] = bigram_w2.len() as u32;
+            match w1 {
+                0 => {
+                    bigram_w2.extend_from_slice(&[13, 19, 20, 22, 26, 27, 29]);
+                    bigram_logp.extend_from_slice(&[-1.5, -1.0, -1.0, -1.0, -1.0, -1.5, -1.5]);
+                    bigram_bow.extend_from_slice(&[-0.1; 7]);
+                }
+                19 | 20 | 22 | 26 | 29 => {
+                    bigram_w2.push(EOS_ID);
+                    bigram_logp.push(-0.2);
+                    bigram_bow.push(-0.1);
+                }
+                13 => {
+                    bigram_w2.push(20);
+                    bigram_logp.push(-1.2);
+                    bigram_bow.push(-0.1);
+                }
+                _ => {}
+            }
+        }
+        bigram_offsets[n] = bigram_w2.len() as u32;
+        let trigram_offsets = vec![0u32; bigram_w2.len() + 1];
+
+        let model = Model::from_parts(
+            word_offsets,
+            word_bytes,
+            unigram_logp,
+            unigram_bow,
+            exact,
+            initial_chars,
+            abbrev_tail,
+            abbrev_init,
+            bigram_offsets,
+            bigram_w2,
+            bigram_logp,
+            bigram_bow,
+            trigram_offsets,
+            Vec::new(),
+            Vec::new(),
+        );
+        let cfg = DecoderConfig::default();
+
+        // Unreachable strings (`config`, `git`, `github`) return empty items without leaking Tier 2/3 Chinese prefixes.
+        for unr in ["config", "git", "github"] {
+            let out = decode_rich_with_user(&model, None, None, unr, "", 250, &cfg);
+            assert!(
+                out.items.is_empty(),
+                "expected unreachable '{unr}' to yield empty items, got {:?}",
+                out.items
+            );
+            assert_eq!(out.segmented_preedit, unr);
+        }
+
+        // Implausible English abbrev+vowel/bare-o chains (`liltoon`, `nilotoon`, `lilto`, `niloto`,
+        // `toon`, `code`) are suppressed completely.
+        for eng in ["liltoon", "nilotoon", "lilto", "niloto", "toon", "code"] {
+            let out = decode_rich_with_user(&model, None, None, eng, "", 250, &cfg);
+            assert!(
+                out.items.is_empty(),
+                "expected English '{eng}' to yield empty items, got {:?}",
+                out.items
+            );
+            assert_eq!(out.segmented_preedit, eng);
+        }
+
+        // Valid Chinese abbreviations, mixed inputs, apostrophe-separated inputs, and mid-typing prefixes
+        // continue to produce normal Chinese candidates.
+        let yuangc_out = decode_rich_with_user(&model, None, None, "yuangc", "", 50, &cfg);
+        assert!(
+            matches!(
+                yuangc_out.items.first().map(|x| x.text.as_str()),
+                Some("原告称" | "原工程")
+            ),
+            "unexpected yuangc top1: {:?}",
+            yuangc_out.items
+        );
+        assert_eq!(
+            decode_rich_with_user(&model, None, None, "yuan'gc", "", 50, &cfg)
+                .items
+                .first()
+                .map(|x| x.text.as_str()),
+            Some("原工程")
+        );
+        assert!(
+            !decode_rich_with_user(&model, None, None, "yuang", "", 50, &cfg)
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            decode_rich_with_user(&model, None, None, "gc", "", 50, &cfg)
+                .items
+                .first()
+                .map(|x| x.text.as_str()),
+            Some("工程")
+        );
+        assert_eq!(
+            decode_rich_with_user(&model, None, None, "haod", "", 50, &cfg)
+                .items
+                .first()
+                .map(|x| x.text.as_str()),
+            Some("好的")
+        );
+        assert!(!decode_rich_with_user(&model, None, None, "zho", "", 50, &cfg)
+            .items
+            .is_empty());
+        assert!(!decode_rich_with_user(&model, None, None, "zhon", "", 50, &cfg)
+            .items
+            .is_empty());
     }
 }

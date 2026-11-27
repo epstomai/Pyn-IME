@@ -1081,6 +1081,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 None
             };
             let fire_undo = if !eaten && fallback_commit.is_none() {
+                st.session.note_passthrough_key(ev, mods);
                 st.session.should_undo_on_passthrough_key(ev, mods)
             } else {
                 false
@@ -1171,7 +1172,17 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             );
             return Ok(BOOL(1));
         }
-        let action = self.inner.borrow_mut().session.handle_key(ev, mods);
+        let need_ctx = self.inner.borrow().session.needs_idle_punct_context(ev, mods);
+        let action = if need_ctx {
+            let (ctx_str, _) = self.read_context_and_caret(context);
+            let prev_ch = ctx_str.chars().last();
+            self.inner
+                .borrow_mut()
+                .session
+                .handle_key_with_context(ev, mods, prev_ch)
+        } else {
+            self.inner.borrow_mut().session.handle_key(ev, mods)
+        };
         let act_name = action_name(&action);
         let eaten = !matches!(action, KeyAction::PassThrough | KeyAction::PassThroughAndUndo);
         let applied = self.execute_action(context, action);

@@ -66,6 +66,8 @@ struct LockedSegment {
 pub struct SessionController {
     mode: InputMode,
     chinese_punct: bool,
+    smart_english_punct: bool,
+    underscore_halfwidth: bool,
     shift_toggle_enabled: bool,
     initial_upper_english: bool,
     page_size: usize,
@@ -80,6 +82,7 @@ pub struct SessionController {
     selected_before_tab: Option<usize>,
     selected: usize,
     just_committed_chinese: bool,
+    last_fallback_tail: Option<char>,
     shift_pending_tap: bool,
     shift_combo_used: bool,
     open_double_quote: bool,
@@ -97,6 +100,8 @@ impl SessionController {
         Self {
             mode: InputMode::Chinese,
             chinese_punct: true,
+            smart_english_punct: true,
+            underscore_halfwidth: true,
             shift_toggle_enabled: true,
             initial_upper_english: true,
             page_size: 5,
@@ -111,6 +116,7 @@ impl SessionController {
             selected_before_tab: None,
             selected: 0,
             just_committed_chinese: false,
+            last_fallback_tail: None,
             shift_pending_tap: false,
             shift_combo_used: false,
             open_double_quote: true,
@@ -142,10 +148,28 @@ impl SessionController {
         self.initial_upper_english
     }
 
+    pub fn set_smart_english_punct(&mut self, enabled: bool) {
+        self.smart_english_punct = enabled;
+    }
+
+    pub fn smart_english_punct(&self) -> bool {
+        self.smart_english_punct
+    }
+
+    pub fn set_underscore_halfwidth(&mut self, enabled: bool) {
+        self.underscore_halfwidth = enabled;
+    }
+
+    pub fn underscore_halfwidth(&self) -> bool {
+        self.underscore_halfwidth
+    }
+
     pub fn apply_config(&mut self, cfg: &ImeConfig, prev: Option<&ImeConfig>) {
         self.set_page_size(cfg.page_size);
         self.set_shift_toggle_enabled(cfg.shift_toggle);
         self.set_initial_upper_english(cfg.initial_upper_english);
+        self.set_smart_english_punct(cfg.smart_english_punct);
+        self.set_underscore_halfwidth(cfg.underscore_halfwidth);
         if prev.is_none()
             || prev.is_some_and(|p| p.default_chinese_punct != cfg.default_chinese_punct)
         {
@@ -187,7 +211,9 @@ impl SessionController {
         self.locked_segments.is_empty()
             && self.is_composing()
             && (self.mode == InputMode::English
-                || self.keys.bytes().any(|b| b.is_ascii_uppercase()))
+                || self.keys.bytes().any(|b| {
+                    b.is_ascii_uppercase() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-')
+                }))
     }
 
     pub fn has_locked(&self) -> bool {
@@ -376,7 +402,69 @@ impl SessionController {
         }
     }
 
+    pub fn needs_idle_punct_context(&self, event: KeyEvent, mods: KeyModifiers) -> bool {
+        if self.is_composing()
+            || self.mode != InputMode::Chinese
+            || !self.chinese_punct
+            || !self.smart_english_punct
+            || mods.ctrl
+            || mods.alt
+            || mods.win
+        {
+            return false;
+        }
+        match event {
+            KeyEvent::Char('_') => !self.underscore_halfwidth,
+            KeyEvent::Char(ch) => matches!(ch, '.' | ':' | '^' | '<' | '>' | '\''),
+            _ => false,
+        }
+    }
+
+    pub fn note_passthrough_key(&mut self, event: KeyEvent, mods: KeyModifiers) {
+        if mods.ctrl || mods.alt || mods.win {
+            self.last_fallback_tail = None;
+            return;
+        }
+        match event {
+            KeyEvent::ShiftDown | KeyEvent::ShiftUp => {}
+            KeyEvent::Digit(d) if d <= 9 => {
+                self.last_fallback_tail = Some((b'0' + d) as char);
+            }
+            KeyEvent::Char(ch) | KeyEvent::UpperChar(ch) | KeyEvent::RawChar(ch) => {
+                self.last_fallback_tail = Some(ch);
+            }
+            KeyEvent::Space => {
+                self.last_fallback_tail = Some(' ');
+            }
+            _ => {
+                self.last_fallback_tail = None;
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, event: KeyEvent, mods: KeyModifiers) -> KeyAction {
+        self.handle_key_with_context(event, mods, None)
+    }
+
+    pub fn handle_key_with_context(
+        &mut self,
+        event: KeyEvent,
+        mods: KeyModifiers,
+        host_preceding_char: Option<char>,
+    ) -> KeyAction {
+        let action = self.handle_key_inner(event, mods, host_preceding_char);
+        if let KeyAction::Commit { ref text, .. } = action {
+            self.last_fallback_tail = text.chars().last();
+        }
+        action
+    }
+
+    fn handle_key_inner(
+        &mut self,
+        event: KeyEvent,
+        mods: KeyModifiers,
+        host_preceding_char: Option<char>,
+    ) -> KeyAction {
         if mods.ctrl || mods.alt || mods.win {
             self.shift_pending_tap = false;
             self.shift_combo_used = mods.shift;
@@ -452,7 +540,14 @@ impl SessionController {
                     }
                 }
                 KeyEvent::Char(ch) if self.chinese_punct && is_mapped_punct(ch) => {
-                    if let Some(mapped) = self.map_punct(ch) {
+                    let effective_prev = host_preceding_char.or(self.last_fallback_tail);
+                    if self.should_emit_halfwidth_idle_punct(ch, effective_prev) {
+                        KeyAction::Commit {
+                            text: ch.to_string(),
+                            learn_keys: None,
+                            learn_text: None,
+                        }
+                    } else if let Some(mapped) = self.map_punct(ch) {
                         KeyAction::Commit {
                             text: mapped.to_owned(),
                             learn_keys: None,
@@ -560,12 +655,20 @@ impl SessionController {
                 }
             }
             KeyEvent::Char('/') if !mods.shift => {
-                let mut text = self.take_composing_reset(false);
-                text.push('/');
-                KeyAction::Commit {
-                    text,
-                    learn_keys: None,
-                    learn_text: None,
+                if self.is_english_composing() && self.smart_english_punct {
+                    if self.keys.len() < MAX_KEYS_LEN {
+                        self.append_english_connector('/')
+                    } else {
+                        KeyAction::ConsumedNoChange
+                    }
+                } else {
+                    let mut text = self.take_composing_reset(false);
+                    text.push('/');
+                    KeyAction::Commit {
+                        text,
+                        learn_keys: None,
+                        learn_text: None,
+                    }
                 }
             }
             KeyEvent::Char('\'') if !mods.shift => {
@@ -712,6 +815,15 @@ impl SessionController {
                     need_convert: false,
                 }
             }
+            KeyEvent::Char('-')
+                if self.is_english_composing() && self.smart_english_punct && !mods.shift =>
+            {
+                if self.keys.len() < MAX_KEYS_LEN {
+                    self.append_english_connector('-')
+                } else {
+                    KeyAction::ConsumedNoChange
+                }
+            }
             KeyEvent::PageUp | KeyEvent::Char('-') => {
                 let view_len = self.active_view_len();
                 if view_len > 0 {
@@ -741,6 +853,12 @@ impl SessionController {
             }
             KeyEvent::Char(ch) if is_mapped_punct(ch) => {
                 if self.is_english_composing() {
+                    if self.smart_english_punct && matches!(ch, '_' | '.' | ':') {
+                        if self.keys.len() < MAX_KEYS_LEN {
+                            return self.append_english_connector(ch);
+                        }
+                        return KeyAction::ConsumedNoChange;
+                    }
                     let picked = self
                         .candidates
                         .get(self.selected)
@@ -753,11 +871,26 @@ impl SessionController {
                         learn_text: None,
                     };
                 }
-                let punct_owned = if self.chinese_punct {
-                    self.map_punct(ch).unwrap_or("").to_owned()
-                } else {
-                    ch.to_string()
-                };
+                if self.underscore_halfwidth
+                    && self.smart_english_punct
+                    && ch == '_'
+                    && self.locked_segments.is_empty()
+                    && self.keys.len() < MAX_KEYS_LEN
+                {
+                    return self.append_english_connector('_');
+                }
+                let has_full_chinese = self
+                    .choices
+                    .iter()
+                    .any(|c| c.consumed_len >= self.keys.len() && !c.text.is_ascii());
+                if self.smart_english_punct
+                    && matches!(ch, '.' | ':')
+                    && self.locked_segments.is_empty()
+                    && !has_full_chinese
+                    && self.keys.len() < MAX_KEYS_LEN
+                {
+                    return self.append_english_connector(ch);
+                }
                 // Never drop trailing unconsumed pinyin on punctuation commit: if the active choice
                 // is only a prefix, promote the full-span candidate (or remaining raw keys).
                 let full_choice = self
@@ -770,6 +903,17 @@ impl SessionController {
                             .cloned()
                     });
                 let picked_text = full_choice.map(|c| c.text);
+                let punct_owned = if !self.chinese_punct
+                    || (ch == '_' && self.underscore_halfwidth)
+                    || (picked_text.is_none()
+                        && self.locked_segments.is_empty()
+                        && self.smart_english_punct
+                        && matches!(ch, '.' | ':' | '_' | '^' | '<' | '>' | '\''))
+                {
+                    ch.to_string()
+                } else {
+                    self.map_punct(ch).unwrap_or("").to_owned()
+                };
                 let locked_prefix = self.locked_text();
                 let locked_raw = self.locked_raw_keys();
                 let rem_keys = self.keys.clone();
@@ -862,6 +1006,7 @@ impl SessionController {
     pub fn on_focus_change(&mut self) {
         self.reset_composing();
         self.just_committed_chinese = false;
+        self.last_fallback_tail = None;
         self.shift_pending_tap = false;
         self.shift_combo_used = false;
     }
@@ -946,6 +1091,41 @@ impl SessionController {
         }
     }
 
+    fn append_english_connector(&mut self, ch: char) -> KeyAction {
+        if self.is_english_composing() {
+            if let Some(picked) = self.candidates.get(self.selected).cloned() {
+                if picked != self.keys && picked.len() < MAX_KEYS_LEN {
+                    self.keys = picked;
+                }
+            }
+        }
+        if self.keys.len() < MAX_KEYS_LEN {
+            self.keys.push(ch);
+            self.exit_single_char_mode();
+            self.refresh_english_candidates();
+            KeyAction::UpdateComposition {
+                need_convert: false,
+            }
+        } else {
+            KeyAction::ConsumedNoChange
+        }
+    }
+
+    fn should_emit_halfwidth_idle_punct(&self, ch: char, prev: Option<char>) -> bool {
+        if ch == '_' && self.underscore_halfwidth {
+            return true;
+        }
+        if !self.smart_english_punct {
+            return false;
+        }
+        match ch {
+            '.' => prev.is_none() || prev.is_some_and(|c| is_ascii_ident_prev(c) || c.is_whitespace()),
+            ':' | '_' | '^' | '<' | '>' => prev.is_some_and(is_ascii_ident_prev),
+            '\'' => prev.is_some_and(|c| c.is_ascii_alphabetic()),
+            _ => false,
+        }
+    }
+
     fn refresh_english_candidates(&mut self) {
         let cands = suggest_english_candidates(&self.keys, 15);
         self.set_candidates(cands);
@@ -990,6 +1170,11 @@ impl SessionController {
             _ => None,
         }
     }
+}
+
+#[inline]
+fn is_ascii_ident_prev(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '\\' | ':' | '-' | '@' | '#')
 }
 
 #[inline]

@@ -45,6 +45,54 @@ pub fn syllable_str(id: SyllableId) -> &'static str {
     SYLLABLES.get(id.saturating_sub(1) as usize).copied().unwrap_or("")
 }
 
+pub(crate) fn has_syllable_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    let idx = SYLLABLES.partition_point(|&s| s < prefix);
+    SYLLABLES.get(idx).is_some_and(|s| s.starts_with(prefix))
+}
+
+/// Returns `true` if `keys` can be segmented as zero or more standard exact syllables followed by
+/// an optional valid syllable prefix. Excludes rare mid-word dialect `"lo"` as a completed syllable
+/// while still allowing `"lo"` as a trailing prefix (e.g. `kulo` -> `kulong`).
+pub(crate) fn is_standard_pinyin_prefix(keys: &str) -> bool {
+    let mut norm = Vec::with_capacity(keys.len());
+    for &b in keys.as_bytes() {
+        if b == b'\'' {
+            continue;
+        }
+        if b.is_ascii_alphabetic() {
+            norm.push(b.to_ascii_lowercase());
+        } else {
+            return false;
+        }
+    }
+    let n = norm.len();
+    if n == 0 {
+        return false;
+    }
+    let mut dp = vec![false; n + 1];
+    dp[0] = true;
+    for i in 0..n {
+        if !dp[i] {
+            continue;
+        }
+        let max_len = 6.min(n - i);
+        for len in 1..=max_len {
+            if let Ok(sub) = std::str::from_utf8(&norm[i..i + len]) {
+                if sub != "lo" && syllable_id(sub).is_some() {
+                    dp[i + len] = true;
+                }
+                if i + len == n && has_syllable_prefix(sub) {
+                    return true;
+                }
+            }
+        }
+    }
+    dp[n]
+}
+
 pub fn letter_index(b: u8) -> Option<u8> {
     let lower = b.to_ascii_lowercase();
     if lower.is_ascii_lowercase() {
@@ -202,6 +250,7 @@ pub struct PinyinDag {
     pub exact_only: bool,
     pub edges_from: Vec<Vec<DagEdge>>,
     pub norm_byte_starts: Vec<usize>,
+    pub explicit_boundary_before: Vec<bool>,
 }
 
 impl PinyinDag {
@@ -223,6 +272,14 @@ impl PinyinDag {
 /// Whenever at least one full exact-syllable path reaches the end, `Abbrev` edges are omitted
 /// completely so abbreviated matches can never outrank exact pinyin.
 pub fn build_dag(keys: &str) -> PinyinDag {
+    build_dag_impl(keys, false)
+}
+
+pub(crate) fn build_dag_with_abbrev(keys: &str) -> PinyinDag {
+    build_dag_impl(keys, true)
+}
+
+fn build_dag_impl(keys: &str, force_abbrev: bool) -> PinyinDag {
     let raw_len = keys.len();
     let mut norm = Vec::with_capacity(raw_len);
     let mut norm_byte_starts = Vec::with_capacity(raw_len);
@@ -248,6 +305,7 @@ pub fn build_dag(keys: &str) -> PinyinDag {
                 exact_only: true,
                 edges_from: Vec::new(),
                 norm_byte_starts: Vec::new(),
+                explicit_boundary_before: Vec::new(),
             };
         }
     }
@@ -260,6 +318,7 @@ pub fn build_dag(keys: &str) -> PinyinDag {
             exact_only: true,
             edges_from: Vec::new(),
             norm_byte_starts: Vec::new(),
+            explicit_boundary_before: Vec::new(),
         };
     }
 
@@ -289,7 +348,7 @@ pub fn build_dag(keys: &str) -> PinyinDag {
     }
 
     let exact_only = can_reach[n];
-    if !exact_only {
+    if !exact_only || force_abbrev {
         for i in 0..n {
             let letter = norm[i] - b'a';
             if is_valid_initial_letter(letter) {
@@ -323,5 +382,6 @@ pub fn build_dag(keys: &str) -> PinyinDag {
         exact_only,
         edges_from,
         norm_byte_starts,
+        explicit_boundary_before: boundary_before,
     }
 }

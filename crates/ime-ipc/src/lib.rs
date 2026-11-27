@@ -650,6 +650,8 @@ mod tests {
             show_preedit_caret: false,
             show_mode_toast: false,
             default_chinese_punct: false,
+            smart_english_punct: false,
+            underscore_halfwidth: false,
             shift_toggle: false,
             initial_upper_english: false,
             learning_enabled: false,
@@ -676,13 +678,16 @@ mod tests {
         let dec: IpcRequest = read_frame(&mut cur).unwrap();
         assert_eq!(dec, req);
 
-        // SessionController applies page_size, shift_toggle, initial_upper_english, default_chinese_punct.
+        // SessionController applies page_size, shift_toggle, initial_upper_english,
+        // default_chinese_punct, smart_english_punct, underscore_halfwidth.
         let mut s = SessionController::new();
         s.apply_config(&norm, None);
         assert_eq!(s.page_size(), 9);
         assert!(!s.shift_toggle_enabled());
         assert!(!s.initial_upper_english());
         assert!(!s.chinese_punct());
+        assert!(!s.smart_english_punct());
+        assert!(!s.underscore_halfwidth());
         assert_eq!(s.take_preserved_shift_tap(), None);
         assert!(!s.should_consume(KeyEvent::UpperChar('N'), KeyModifiers { shift: true, ..Default::default() }));
 
@@ -873,6 +878,307 @@ mod tests {
                 text: "A[".into(),
                 learn_keys: None,
                 learn_text: None,
+            }
+        );
+    }
+
+    #[test]
+    fn smart_english_punctuation_underscore_and_seamless_identifier_typing() {
+        use crate::protocol::{WireCandidate, WireCandidateKind};
+
+        let mut s = SessionController::new();
+        let none = KeyModifiers::default();
+        let shift = KeyModifiers {
+            shift: true,
+            ..Default::default()
+        };
+
+        // 1. `_` defaults to halfwidth `_` even after Chinese text or in idle Chinese mode.
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('_'), shift, Some('中')),
+            KeyAction::Commit {
+                text: "_".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+
+        // Disabling `underscore_halfwidth` emits `——` after Chinese, while `smart_english_punct` still protects English/digits.
+        s.set_underscore_halfwidth(false);
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('_'), shift, Some('中')),
+            KeyAction::Commit {
+                text: "——".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('_'), shift, Some('a')),
+            KeyAction::Commit {
+                text: "_".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+        s.set_underscore_halfwidth(true);
+
+        // 2. Context-aware `.`: halfwidth at start of line, after digit/alpha/path/space; fullwidth `。` after Hanzi / Chinese closing punct.
+        for prev in [None, Some('3'), Some('n'), Some('/'), Some('.'), Some('_'), Some(' ')] {
+            assert_eq!(
+                s.handle_key_with_context(KeyEvent::Char('.'), none, prev),
+                KeyAction::Commit {
+                    text: ".".into(),
+                    learn_keys: None,
+                    learn_text: None,
+                },
+                "expected '.' after {prev:?}"
+            );
+        }
+        for prev in [Some('好'), Some('）'), Some('”')] {
+            assert_eq!(
+                s.handle_key_with_context(KeyEvent::Char('.'), none, prev),
+                KeyAction::Commit {
+                    text: "。".into(),
+                    learn_keys: None,
+                    learn_text: None,
+                },
+                "expected '。' after {prev:?}"
+            );
+        }
+
+        // 3. Context-aware `:`, `^`, `<`, `>`, and `'`: halfwidth after ASCII identifiers/digits, fullwidth after Chinese.
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char(':'), shift, Some('2')),
+            KeyAction::Commit { text: ":".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char(':'), shift, Some('说')),
+            KeyAction::Commit { text: "：".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('^'), shift, Some('2')),
+            KeyAction::Commit { text: "^".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('^'), shift, Some('恩')),
+            KeyAction::Commit { text: "……".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('<'), shift, Some('c')),
+            KeyAction::Commit { text: "<".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('>'), shift, Some('T')),
+            KeyAction::Commit { text: ">".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('<'), shift, Some('读')),
+            KeyAction::Commit { text: "《".into(), learn_keys: None, learn_text: None }
+        );
+
+        // `don't` emits ASCII `'` without flipping paired Chinese single quotes `‘’`.
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('\''), none, Some('n')),
+            KeyAction::Commit { text: "'".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('\''), none, Some('说')),
+            KeyAction::Commit { text: "‘".into(), learn_keys: None, learn_text: None }
+        );
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('\''), none, Some('他')),
+            KeyAction::Commit { text: "’".into(), learn_keys: None, learn_text: None }
+        );
+
+        // Disabling `smart_english_punct` reverts `.` / `:` / `'` after ASCII back to fullwidth.
+        s.set_smart_english_punct(false);
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('.'), none, Some('3')),
+            KeyAction::Commit { text: "。".into(), learn_keys: None, learn_text: None }
+        );
+        s.set_smart_english_punct(true);
+
+        // 4. Fallback tracking when host returns None for context (`GetText` unavailable).
+        s.on_focus_change();
+        s.note_passthrough_key(KeyEvent::Digit(3), none);
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('.'), none, None),
+            KeyAction::Commit { text: ".".into(), learn_keys: None, learn_text: None }
+        );
+        s.handle_key(KeyEvent::Char('w'), none);
+        s.handle_key(KeyEvent::Char('o'), none);
+        s.set_candidates(vec!["我".into()]);
+        s.handle_key(KeyEvent::Space, none);
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('.'), none, None),
+            KeyAction::Commit { text: "。".into(), learn_keys: None, learn_text: None }
+        );
+        s.note_passthrough_key(KeyEvent::Enter, none);
+        assert_eq!(
+            s.handle_key_with_context(KeyEvent::Char('.'), none, None),
+            KeyAction::Commit { text: ".".into(), learn_keys: None, learn_text: None }
+        );
+
+        // 5. Seamless identifier typing inside uppercase English composing (`Input_Engine`, `README.md`, `Pyn-IME`).
+        for (ev, m) in [
+            (KeyEvent::UpperChar('I'), shift),
+            (KeyEvent::Char('n'), none),
+            (KeyEvent::Char('p'), none),
+            (KeyEvent::Char('u'), none),
+            (KeyEvent::Char('t'), none),
+            (KeyEvent::Char('_'), shift),
+            (KeyEvent::UpperChar('E'), shift),
+            (KeyEvent::Char('n'), none),
+            (KeyEvent::Char('g'), none),
+            (KeyEvent::Char('i'), none),
+            (KeyEvent::Char('n'), none),
+            (KeyEvent::Char('e'), none),
+        ] {
+            assert_eq!(
+                s.handle_key(ev, m),
+                KeyAction::UpdateComposition { need_convert: false }
+            );
+        }
+        assert_eq!(s.keys(), "Input_Engine");
+        assert_eq!(
+            s.handle_key(KeyEvent::Space, none),
+            KeyAction::Commit {
+                text: "Input_Engine".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+
+        for (ev, m) in [
+            (KeyEvent::UpperChar('R'), shift),
+            (KeyEvent::UpperChar('E'), shift),
+            (KeyEvent::UpperChar('A'), shift),
+            (KeyEvent::UpperChar('D'), shift),
+            (KeyEvent::UpperChar('M'), shift),
+            (KeyEvent::UpperChar('E'), shift),
+            (KeyEvent::Char('.'), none),
+            (KeyEvent::Char('m'), none),
+            (KeyEvent::Char('d'), none),
+        ] {
+            s.handle_key(ev, m);
+        }
+        assert_eq!(s.keys(), "README.md");
+        assert_eq!(
+            s.handle_key(KeyEvent::Space, none),
+            KeyAction::Commit {
+                text: "README.md".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+
+        for (ev, m) in [
+            (KeyEvent::UpperChar('P'), shift),
+            (KeyEvent::Char('y'), none),
+            (KeyEvent::Char('n'), none),
+            (KeyEvent::Char('-'), none),
+            (KeyEvent::UpperChar('I'), shift),
+            (KeyEvent::UpperChar('M'), shift),
+            (KeyEvent::UpperChar('E'), shift),
+        ] {
+            s.handle_key(ev, m);
+        }
+        assert_eq!(s.keys(), "Pyn-IME");
+        assert_eq!(
+            s.handle_key(KeyEvent::Space, none),
+            KeyAction::Commit {
+                text: "Pyn-IME".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+
+        // 6. Lowercase Chinese composing + `_` transitions to English (`user_dict`), Backspace reverts to Chinese.
+        for ch in "user".chars() {
+            assert_eq!(
+                s.handle_key(KeyEvent::Char(ch), none),
+                KeyAction::UpdateComposition { need_convert: true }
+            );
+        }
+        assert_eq!(
+            s.handle_key(KeyEvent::Char('_'), shift),
+            KeyAction::UpdateComposition { need_convert: false }
+        );
+        assert!(s.is_english_composing());
+        assert_eq!(s.keys(), "user_");
+        // Backspace back to `user` resumes Chinese decoding.
+        assert_eq!(
+            s.handle_key(KeyEvent::Backspace, none),
+            KeyAction::UpdateComposition { need_convert: true }
+        );
+        assert!(!s.is_english_composing());
+        assert_eq!(
+            s.handle_key(KeyEvent::Char('_'), shift),
+            KeyAction::UpdateComposition { need_convert: false }
+        );
+        for ch in "dict".chars() {
+            s.handle_key(KeyEvent::Char(ch), none);
+        }
+        assert_eq!(
+            s.handle_key(KeyEvent::Space, none),
+            KeyAction::Commit {
+                text: "user_dict".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+
+        // 7. Lowercase non-pinyin (`config` with only prefix candidates, no full-span Chinese) + `.` -> `config.json`.
+        for ch in "config".chars() {
+            s.handle_key(KeyEvent::Char(ch), none);
+        }
+        s.set_rich_candidates(
+            vec![WireCandidate {
+                text: "吃哦".into(),
+                consumed_len: 2,
+                kind: WireCandidateKind::PrefixWord,
+            }],
+            Some("c'o'n'f'i'g".into()),
+            None,
+            1,
+        );
+        assert_eq!(
+            s.handle_key(KeyEvent::Char('.'), none),
+            KeyAction::UpdateComposition { need_convert: false }
+        );
+        for ch in "json".chars() {
+            s.handle_key(KeyEvent::Char(ch), none);
+        }
+        assert_eq!(
+            s.handle_key(KeyEvent::Space, none),
+            KeyAction::Commit {
+                text: "config.json".into(),
+                learn_keys: None,
+                learn_text: None,
+            }
+        );
+
+        // Whereas valid full-span pinyin (`nihao` -> `你好`) + `.` still commits `你好。`.
+        for ch in "nihao".chars() {
+            s.handle_key(KeyEvent::Char(ch), none);
+        }
+        s.set_rich_candidates(
+            vec![WireCandidate {
+                text: "你好".into(),
+                consumed_len: 5,
+                kind: WireCandidateKind::Full,
+            }],
+            Some("ni'hao".into()),
+            None,
+            2,
+        );
+        assert_eq!(
+            s.handle_key(KeyEvent::Char('.'), none),
+            KeyAction::Commit {
+                text: "你好。".into(),
+                learn_keys: Some("nihao".into()),
+                learn_text: Some("你好".into()),
             }
         );
     }
